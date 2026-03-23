@@ -47,6 +47,8 @@
 
 执行器会调用它创建邮箱地址、列出邮件、读取邮件正文。
 
+如果你要自己实现这套接口，直接看 [temp-mail-api.md](temp-mail-api.md)。
+
 ## temp_mail_admin_password
 
 临时邮箱后台管理口令，用于创建新邮箱地址。

@@ -119,6 +119,7 @@ python DrissionPage_example.py --count 1
 - 新手快速上手：[docs/quickstart.md](docs/quickstart.md)
 - 完整业务链路：[docs/business-flow.md](docs/business-flow.md)
 - 配置字段说明：[docs/options.md](docs/options.md)
+- 临时邮箱接口要求：[docs/temp-mail-api.md](docs/temp-mail-api.md)
 - 模块边界和架构：[docs/architecture.md](docs/architecture.md)
 
 ## 项目结构

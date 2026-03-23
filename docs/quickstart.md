@@ -16,6 +16,7 @@
 
 - `warp` 和 `grok2api` 已经内置在本仓库的 `docker compose` 里
 - 你第一次部署时主要还需要自己准备临时邮箱 API
+- 临时邮箱接口长什么样，直接看 [temp-mail-api.md](temp-mail-api.md)
 
 宿主机模式下，至少准备好：
 
@@ -76,6 +77,10 @@ cp config.example.json config.json
 - `temp_mail_api_base`
 - `temp_mail_admin_password`
 - `temp_mail_domain`
+
+如果你不是用现成邮箱服务，而是准备自己实现接口：
+
+- 先看 [temp-mail-api.md](temp-mail-api.md)
 
 如果你已经使用根目录 `docker-compose.yml` 起整套服务：
 
