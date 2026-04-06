@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import string
@@ -47,6 +48,23 @@ TEMP_MAIL_SITE_PASSWORD = str(_conf.get("temp_mail_site_password", ""))
 PROXY = str(_conf.get("proxy", ""))
 TEMP_MAIL_PROVIDER = str(_conf.get("temp_mail_provider") or "").strip().lower()
 
+_vmail_warn_at: Dict[str, float] = {}
+
+
+def _vmail_warn_throttled(key: str, message: str, interval_sec: float = 12.0) -> None:
+    """避免轮询时刷屏；同一 key 间隔内只打一条。"""
+    now = time.time()
+    last = _vmail_warn_at.get(key, 0.0)
+    if now - last < interval_sec:
+        return
+    _vmail_warn_at[key] = now
+    print(message)
+
+
+def _vmail_debug() -> bool:
+    return os.environ.get("VMAIL_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ============================================================
 # 适配层：为 DrissionPage_example.py 提供简单接口
 # ============================================================
@@ -66,7 +84,7 @@ def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]:
+def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str]:
     """
     轮询收件箱获取 OTP 验证码。
     供 DrissionPage_example.py 调用。
@@ -230,8 +248,14 @@ def fetch_emails(mail_token: str) -> List[Dict[str, Any]]:
                 items = data.get("data") or []
                 if isinstance(items, list):
                     return items
-    except Exception:
-        pass
+        snippet = (res.text or "")[:400].replace("\n", " ")
+        _vmail_warn_throttled(
+            "list_http",
+            f"[Debug] VMAIL 邮件列表 HTTP {res.status_code}: {snippet}",
+        )
+    except Exception as exc:
+        detail = repr(exc) if _vmail_debug() else str(exc)
+        _vmail_warn_throttled("list_exc", f"[Debug] VMAIL 拉取邮件列表异常: {detail}")
     return []
 
 
@@ -259,8 +283,14 @@ def fetch_email_detail(mail_token: str, msg_id: str) -> Optional[Dict[str, Any]]
                 detail = data.get("data") or {}
                 if isinstance(detail, dict):
                     return detail
-    except Exception:
-        pass
+        snippet = (res.text or "")[:400].replace("\n", " ")
+        _vmail_warn_throttled(
+            f"detail_http_{msg_id}",
+            f"[Debug] VMAIL 邮件详情 HTTP {res.status_code} (id={msg_id}): {snippet}",
+        )
+    except Exception as exc:
+        detail = repr(exc) if _vmail_debug() else str(exc)
+        _vmail_warn_throttled(f"detail_exc_{msg_id}", f"[Debug] VMAIL 拉取邮件详情异常 (id={msg_id}): {detail}")
     return None
 
 
@@ -268,13 +298,18 @@ def wait_for_verification_code(mail_token: str, timeout: int = 120) -> Optional[
     """轮询临时邮箱，等待验证码邮件。"""
     start = time.time()
     seen_ids = set()
+    last_status_log = start
 
     while time.time() - start < timeout:
         messages = fetch_emails(mail_token)
+        if time.time() - last_status_log >= 30:
+            elapsed = int(time.time() - start)
+            print(f"[*] VMAIL 轮询收件箱… 已等待 {elapsed}s，当前列表 {len(messages)} 封")
+            last_status_log = time.time()
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            msg_id = msg.get("id")
+            msg_id = msg.get("id") or msg.get("messageId") or msg.get("uuid")
             if not msg_id or msg_id in seen_ids:
                 continue
             seen_ids.add(msg_id)
