@@ -11,7 +11,6 @@ from email.parser import BytesParser
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 try:
     from curl_cffi import requests as curl_requests
@@ -86,17 +85,36 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]
 # ============================================================
 
 
-def _detect_mail_provider(api_base: str) -> str:
-    if TEMP_MAIL_PROVIDER in {"duckmail", "temp-mail", "temp_mail", "generic"}:
-        return "duckmail" if TEMP_MAIL_PROVIDER == "duckmail" else "generic"
-    hostname = (urlparse(api_base).hostname or "").lower()
-    if "duckmail" in hostname:
-        return "duckmail"
-    return "generic"
-
-
 def _provider_label() -> str:
-    return "DuckMail" if _detect_mail_provider(TEMP_MAIL_API_BASE) == "duckmail" else "Temp Mail"
+    return "VMAIL"
+
+
+def _normalize_api_base(api_base: str) -> str:
+    api_base = api_base.strip().rstrip("/")
+    if api_base.endswith("/api-docs"):
+        api_base = api_base[: -len("/api-docs")]
+    if api_base.endswith("/api/v1"):
+        return api_base
+    if api_base.endswith("/api"):
+        return f"{api_base}/v1"
+    return f"{api_base}/api/v1"
+
+
+def _build_vmail_headers() -> Dict[str, str]:
+    if not TEMP_MAIL_ADMIN_PASSWORD:
+        raise Exception("temp_mail_admin_password 未设置，无法访问 VMAIL")
+    return _build_headers({"X-API-Key": TEMP_MAIL_ADMIN_PASSWORD})
+
+
+def _configured_domains() -> List[str]:
+    return [part.strip() for part in TEMP_MAIL_DOMAIN.split(",") if part.strip()]
+
+
+def _choose_vmail_domain() -> str:
+    domains = _configured_domains()
+    if not domains:
+        return ""
+    return random.choice(domains)
 
 def _create_session():
     """创建请求会话（优先 curl_cffi）。"""
@@ -152,305 +170,95 @@ def _generate_mail_password(length: int = 18) -> str:
     return "".join(random.choice(chars) for _ in range(length))
 
 
-def _build_duckmail_headers(token: str = "") -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _extract_duckmail_token(payload: Dict[str, Any]) -> str:
-    for key in ("token", "jwt", "access_token", "id_token"):
-        value = payload.get(key)
-        if value:
-            return str(value)
-    return ""
-
-
-def _extract_duckmail_domain_name(item: Dict[str, Any]) -> str:
-    for key in ("domain", "name", "address"):
-        value = item.get(key)
-        if value:
-            return str(value)
-    return ""
-
-
-def _resolve_duckmail_domain(session, use_cffi, api_base: str) -> str:
-    if TEMP_MAIL_DOMAIN:
-        return TEMP_MAIL_DOMAIN
-
-    headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
-    res = _do_request(
-        session,
-        use_cffi,
-        "get",
-        f"{api_base}/domains",
-        params={"page": 1},
-        headers=headers,
-        timeout=20,
-    )
-    if res.status_code != 200:
-        raise Exception(f"获取 DuckMail 域名失败: {res.status_code} - {res.text[:200]}")
-
-    data = res.json()
-    if not isinstance(data, dict):
-        raise Exception("DuckMail 域名接口返回格式异常")
-
-    domains = data.get("hydra:member") or data.get("data") or data.get("results") or []
-    if not isinstance(domains, list) or not domains:
-        raise Exception("DuckMail 域名列表为空，请在配置里显式填写 temp_mail_domain")
-
-    public_verified: List[str] = []
-    verified: List[str] = []
-    fallback: List[str] = []
-    for item in domains:
-        if not isinstance(item, dict):
-            continue
-        domain = _extract_duckmail_domain_name(item)
-        if not domain:
-            continue
-        fallback.append(domain)
-        if item.get("isVerified") is True:
-            verified.append(domain)
-            if item.get("isPublic") is True or item.get("ownerId") in (None, "", 0):
-                public_verified.append(domain)
-
-    for candidates in (public_verified, verified, fallback):
-        if candidates:
-            return candidates[0]
-    raise Exception("DuckMail 域名列表里没有可用域名，请在配置里显式填写 temp_mail_domain")
-
-
-def _create_duckmail_email() -> Tuple[str, str, str]:
-    api_base = TEMP_MAIL_API_BASE.rstrip("/")
-    session, use_cffi = _create_session()
-    domain = _resolve_duckmail_domain(session, use_cffi, api_base)
-    create_headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
-    last_error = ""
-
-    for _ in range(5):
-        email_local = _generate_local_part(random.randint(8, 12))
-        email = f"{email_local}@{domain}"
-        password = _generate_mail_password()
-
-        res = _do_request(
-            session,
-            use_cffi,
-            "post",
-            f"{api_base}/accounts",
-            json={
-                "address": email,
-                "password": password,
-                "expiresIn": 86400,
-            },
-            headers=create_headers,
-            timeout=20,
-        )
-        if res.status_code in {200, 201}:
-            auth_res = _do_request(
-                session,
-                use_cffi,
-                "post",
-                f"{api_base}/token",
-                json={"address": email, "password": password},
-                timeout=20,
-            )
-            if auth_res.status_code != 200:
-                raise Exception(f"登录 DuckMail 邮箱失败: {auth_res.status_code} - {auth_res.text[:200]}")
-
-            token_data = auth_res.json()
-            if not isinstance(token_data, dict):
-                raise Exception("DuckMail token 接口返回格式异常")
-
-            mail_token = _extract_duckmail_token(token_data)
-            if not mail_token:
-                raise Exception(f"DuckMail token 接口未返回 token: {token_data}")
-
-            print(f"[*] DuckMail 临时邮箱创建成功: {email}")
-            return email, password, mail_token
-
-        if res.status_code in {409, 422}:
-            last_error = f"{res.status_code} - {res.text[:200]}"
-            continue
-
-        raise Exception(f"创建 DuckMail 邮箱失败: {res.status_code} - {res.text[:200]}")
-
-    raise Exception(f"创建 DuckMail 邮箱失败，重试后仍冲突: {last_error}")
-
-
 def create_temp_email() -> Tuple[str, str, str]:
     """创建临时邮箱地址，返回 (email, password, mail_token)。"""
     if not TEMP_MAIL_API_BASE:
         raise Exception("temp_mail_api_base 未设置，无法创建临时邮箱")
 
-    provider = _detect_mail_provider(TEMP_MAIL_API_BASE)
-    if provider == "duckmail":
-        try:
-            return _create_duckmail_email()
-        except Exception as e:
-            raise Exception(f"DuckMail 临时邮箱创建失败: {e}")
-
-    if not TEMP_MAIL_ADMIN_PASSWORD:
-        raise Exception("temp_mail_admin_password 未设置，无法创建临时邮箱")
-    if not TEMP_MAIL_DOMAIN:
-        raise Exception("temp_mail_domain 未设置，无法创建临时邮箱")
-
-    api_base = TEMP_MAIL_API_BASE.rstrip("/")
-    email_local = _generate_local_part(random.randint(8, 12))
+    api_base = _normalize_api_base(TEMP_MAIL_API_BASE)
     session, use_cffi = _create_session()
-    headers = _build_headers({"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD})
+    headers = _build_vmail_headers()
+    payload: Dict[str, Any] = {"expiresIn": 86400}
+    domain = _choose_vmail_domain()
+    if domain:
+        payload["domain"] = domain
 
-    try:
-        res = _do_request(
-            session,
-            use_cffi,
-            "post",
-            f"{api_base}/admin/new_address",
-            json={
-                "name": email_local,
-                "domain": TEMP_MAIL_DOMAIN,
-                "enablePrefix": False,
-            },
-            headers=headers,
-            timeout=20,
-        )
-        if res.status_code != 200:
-            raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
-
-        data = res.json()
-        email = data.get("address") or ""
-        mail_token = data.get("jwt") or ""
-        password = data.get("password") or ""
-        if not email or not mail_token:
-            raise Exception(f"接口返回缺少 address/jwt: {data}")
-
-        print(f"[*] Temp Mail 临时邮箱创建成功: {email}")
-        return email, password, mail_token
-    except Exception as e:
-        raise Exception(f"Temp Mail 临时邮箱创建失败: {e}")
-
-
-def _fetch_duckmail_emails(mail_token: str) -> List[Dict[str, Any]]:
-    api_base = TEMP_MAIL_API_BASE.rstrip("/")
-    headers = _build_duckmail_headers(mail_token)
-    session, use_cffi = _create_session()
     res = _do_request(
         session,
         use_cffi,
-        "get",
-        f"{api_base}/messages",
-        params={"page": 1},
+        "post",
+        f"{api_base}/mailboxes",
+        json=payload,
         headers=headers,
         timeout=20,
     )
-    if res.status_code != 200:
-        return []
-    data = res.json()
-    if not isinstance(data, dict):
-        return []
-    return data.get("hydra:member") or data.get("data") or data.get("results") or data.get("messages") or []
+    if res.status_code not in {200, 201}:
+        raise Exception(f"VMAIL 创建邮箱失败: {res.status_code} - {res.text[:200]}")
+
+    payload = res.json()
+    if not isinstance(payload, dict):
+        raise Exception("VMAIL 创建邮箱返回格式异常")
+
+    data = payload.get("data") or {}
+    email = str(data.get("address") or "")
+    mailbox_id = str(data.get("id") or "")
+    if not email or not mailbox_id:
+        raise Exception(f"VMAIL 创建邮箱缺少 address/id: {payload}")
+
+    print(f"[*] VMAIL 临时邮箱创建成功: {email}")
+    return email, "", mailbox_id
 
 
 def fetch_emails(mail_token: str) -> List[Dict[str, Any]]:
     """获取邮件列表。"""
-    if _detect_mail_provider(TEMP_MAIL_API_BASE) == "duckmail":
-        try:
-            return _fetch_duckmail_emails(mail_token)
-        except Exception:
-            return []
-
     try:
-        api_base = TEMP_MAIL_API_BASE.rstrip("/")
-        headers = _build_headers({"Authorization": f"Bearer {mail_token}"})
+        api_base = _normalize_api_base(TEMP_MAIL_API_BASE)
+        headers = _build_vmail_headers()
         session, use_cffi = _create_session()
         res = _do_request(
             session,
             use_cffi,
             "get",
-            f"{api_base}/api/mails",
-            params={"limit": 20, "offset": 0},
+            f"{api_base}/mailboxes/{mail_token}/messages",
+            params={"page": 1, "limit": 20, "sort": "desc"},
             headers=headers,
             timeout=20,
         )
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, dict):
-                return data.get("results") or data.get("data") or []
+                items = data.get("data") or []
+                if isinstance(items, list):
+                    return items
     except Exception:
         pass
     return []
 
 
 def _normalize_message_id(msg_id: Any) -> str:
-    raw = str(msg_id or "").strip()
-    if raw.startswith("/"):
-        return raw.rsplit("/", 1)[-1]
-    return raw
-
-
-def _fetch_duckmail_email_detail(mail_token: str, msg_id: str) -> Optional[Dict[str, Any]]:
-    api_base = TEMP_MAIL_API_BASE.rstrip("/")
-    normalized_id = _normalize_message_id(msg_id)
-    headers = _build_duckmail_headers(mail_token)
-    session, use_cffi = _create_session()
-
-    res = _do_request(
-        session,
-        use_cffi,
-        "get",
-        f"{api_base}/messages/{normalized_id}",
-        headers=headers,
-        timeout=20,
-    )
-    if res.status_code != 200:
-        return None
-
-    data = res.json()
-    if not isinstance(data, dict):
-        return None
-
-    if not any(data.get(key) for key in ("text", "html", "raw", "source")):
-        src_res = _do_request(
-            session,
-            use_cffi,
-            "get",
-            f"{api_base}/sources/{normalized_id}",
-            headers=headers,
-            timeout=20,
-        )
-        if src_res.status_code == 200:
-            src_data = src_res.json()
-            if isinstance(src_data, dict):
-                raw_source = src_data.get("data") or src_data.get("source") or src_data.get("raw") or ""
-                if raw_source:
-                    data["raw"] = raw_source
-    return data
+    return str(msg_id or "").strip()
 
 
 def fetch_email_detail(mail_token: str, msg_id: str) -> Optional[Dict[str, Any]]:
     """获取单封邮件详情。"""
-    if _detect_mail_provider(TEMP_MAIL_API_BASE) == "duckmail":
-        try:
-            return _fetch_duckmail_email_detail(mail_token, msg_id)
-        except Exception:
-            return None
-
     try:
-        api_base = TEMP_MAIL_API_BASE.rstrip("/")
-        headers = _build_headers({"Authorization": f"Bearer {mail_token}"})
+        api_base = _normalize_api_base(TEMP_MAIL_API_BASE)
+        headers = _build_vmail_headers()
         session, use_cffi = _create_session()
         res = _do_request(
             session,
             use_cffi,
             "get",
-            f"{api_base}/api/mail/{msg_id}",
+            f"{api_base}/mailboxes/{mail_token}/messages/{_normalize_message_id(msg_id)}",
             headers=headers,
             timeout=20,
         )
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, dict):
-                return data
+                detail = data.get("data") or {}
+                if isinstance(detail, dict):
+                    return detail
     except Exception:
         pass
     return None

@@ -49,11 +49,11 @@ docker compose up -d --build
 - `temp_mail_admin_password`
 - `temp_mail_domain`
 
-其中 DuckMail 的推荐填法是：
+其中 VMAIL 的推荐填法是：
 
-- `temp_mail_api_base`: `https://api.duckmail.sbs`
-- `temp_mail_admin_password`: 可留空；如果你要用 DuckMail 私有域名，再填 API Key
-- `temp_mail_domain`: 可留空；留空时执行器会自动挑一个 DuckMail 公开可用域名
+- `temp_mail_api_base`: `https://vmail.dev/api/v1` 或文档页 `https://vmail.liu954326053.workers.dev/api-docs`
+- `temp_mail_admin_password`: 填你的 VMAIL API Key
+- `temp_mail_domain`: 可填单个域名，也可用英文逗号分隔多个域名，例如 `a.com,b.com,c.com`；留空时随机
 
 默认情况下：
 
