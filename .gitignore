@@ -13,3 +13,4 @@ node_modules/
 CLAUDE.md
 /.venv
 /.cursor
+.env

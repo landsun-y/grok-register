@@ -338,9 +338,21 @@ body {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 18px;
+}
+
+.summary-row {
+  display: grid;
+  gap: 12px;
+}
+
+.summary-row-cols-1 {
+  grid-template-columns: 1fr;
+}
+
+.summary-row-cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .detail-grid {
@@ -461,4 +473,104 @@ body {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #f8efe0;
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.nav-link.active {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.workspace-controller {
+  grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
+  align-items: start;
+}
+
+.panel-controller-side {
+  position: sticky;
+  top: 24px;
+}
+
+.summary-grid-compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.controller-settings-form {
+  grid-template-columns: 1fr;
+  margin-top: 8px;
+}
+
+.controller-settings-form label.full {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 1120px) {
+  .workspace-controller {
+    grid-template-columns: 1fr;
+  }
+
+  .panel-controller-side {
+    position: static;
+  }
+}
+
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(18, 12, 8, 0.58);
+}
+
+.modal-dialog {
+  position: relative;
+  width: min(720px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.modal-head {
+  margin-bottom: 16px;
+}
+
+.controller-settings-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 0;
+}
+
+@media (max-width: 720px) {
+  .modal {
+    padding: 16px;
+  }
+
+  .controller-settings-form {
+    grid-template-columns: 1fr;
+  }
 }

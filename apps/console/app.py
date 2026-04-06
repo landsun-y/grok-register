@@ -275,15 +275,18 @@ class SystemSettings(BaseModel):
     api_endpoint: str = ""
     api_token: str = ""
     api_append: bool = True
+    push_batch_size: int = Field(10, ge=1, le=10000)
+    poll_interval_sec: int = Field(30, ge=5, le=3600)
+
+
+class ControllerSettingsPayload(BaseModel):
     concurrency: int = Field(1, ge=1, le=32)
     auto_refill_enabled: bool = False
     start_threshold: int = Field(20, ge=0, le=1000000)
     stop_threshold: int = Field(50, ge=1, le=1000000)
-    push_batch_size: int = Field(10, ge=1, le=10000)
-    poll_interval_sec: int = Field(30, ge=5, le=3600)
 
     @model_validator(mode="after")
-    def validate_thresholds(self) -> "SystemSettings":
+    def validate_thresholds(self) -> "ControllerSettingsPayload":
         if self.start_threshold >= self.stop_threshold:
             raise ValueError("启动阈值必须小于停止阈值")
         return self
@@ -304,6 +307,7 @@ class WorkerProcess:
 @dataclass
 class ControllerRuntime:
     status: str = STATUS_IDLE
+    controller_enabled: bool = False
     desired_running: bool = False
     manual_mode: bool = False
     stop_requested: bool = False
@@ -330,6 +334,7 @@ class ControllerRuntime:
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "controller_enabled": self.controller_enabled,
             "desired_running": self.desired_running,
             "manual_mode": self.manual_mode,
             "stop_requested": self.stop_requested,
@@ -365,8 +370,7 @@ def read_settings() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def write_settings(settings: SystemSettings) -> dict[str, Any]:
-    data = settings.model_dump()
+def write_settings_data(data: dict[str, Any]) -> dict[str, Any]:
     execute_no_return(
         """
         INSERT INTO settings (key, value, updated_at)
@@ -376,6 +380,20 @@ def write_settings(settings: SystemSettings) -> dict[str, Any]:
         ("system", json.dumps(data, ensure_ascii=False), now_iso()),
     )
     return data
+
+
+def write_settings(settings: SystemSettings) -> dict[str, Any]:
+    current = read_settings()
+    data = dict(current)
+    data.update(settings.model_dump())
+    return write_settings_data(data)
+
+
+def write_controller_settings(payload: ControllerSettingsPayload) -> dict[str, Any]:
+    current = read_settings()
+    data = dict(current)
+    data.update(payload.model_dump())
+    return write_settings_data(data)
 
 
 def merged_defaults() -> dict[str, Any]:
@@ -544,18 +562,22 @@ class SingleControllerSupervisor:
         with self._controller_log.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
 
-    def request_manual_start(self) -> None:
+    def request_start(self) -> None:
         with self._lock:
+            self._runtime.controller_enabled = True
             self._runtime.desired_running = True
-            self._runtime.manual_mode = True
+            self._runtime.manual_mode = False
             self._runtime.stop_requested = False
+            self._runtime.completed_count = 0
+            self._runtime.failed_count = 0
             self._runtime.status = STATUS_MANUAL_RUNNING
-            self._runtime.current_phase = "manual_start_requested"
+            self._runtime.current_phase = "controller_enabled"
             self._runtime.last_started_at = now_iso()
-        self.append_log("[controller] 已收到手动开始指令")
+        self.append_log("[controller] 总开关已开启")
 
     def request_stop(self, flush_pending: bool = True) -> None:
         with self._lock:
+            self._runtime.controller_enabled = False
             self._runtime.desired_running = False
             self._runtime.stop_requested = True
             self._runtime.manual_mode = False
@@ -566,7 +588,7 @@ class SingleControllerSupervisor:
                 self._runtime.status = STATUS_IDLE
                 self._runtime.current_phase = "idle"
             self._runtime.last_stopped_at = now_iso()
-        self.append_log("[controller] 已收到停止指令")
+        self.append_log("[controller] 总开关已关闭")
         for slot, worker in list(self._workers.items()):
             try:
                 os.killpg(worker.process.pid, signal.SIGTERM)
@@ -630,6 +652,14 @@ class SingleControllerSupervisor:
                 pass
         for slot in finished_slots:
             self._workers.pop(slot, None)
+        should_flush_pending = False
+        with self._lock:
+            self._runtime.current_running_workers = len(self._workers)
+            self._runtime.pending_token_count = len(self._runtime.pending_tokens)
+            if self._runtime.stop_requested and not self._workers:
+                should_flush_pending = bool(self._runtime.pending_tokens)
+        if should_flush_pending:
+            self._flush_pending(force=True)
         with self._lock:
             self._runtime.current_running_workers = len(self._workers)
             self._runtime.pending_token_count = len(self._runtime.pending_tokens)
@@ -668,7 +698,6 @@ class SingleControllerSupervisor:
                 self._runtime.last_check_at = now_iso()
                 if self._runtime.current_phase not in {"worker_succeeded", "worker_failed", "stopping_workers"}:
                     self._runtime.current_phase = "remote_checked"
-            self.append_log(f"[controller] 远端账号数: {remote_count}")
         except Exception as exc:
             with self._lock:
                 self._runtime.last_check_at = now_iso()
@@ -679,16 +708,26 @@ class SingleControllerSupervisor:
         settings = merged_defaults()
         controller = dict(settings.get("controller") or {})
         with self._lock:
-            if self._runtime.manual_mode:
-                self._runtime.status = STATUS_MANUAL_RUNNING if (self._runtime.desired_running or self._workers) else STATUS_IDLE
-                return
-            if not controller.get("auto_refill_enabled"):
-                if self._runtime.stop_requested and not self._workers:
-                    self._runtime.status = STATUS_IDLE
+            if not self._runtime.controller_enabled:
+                self._runtime.desired_running = False
+                if self._runtime.stop_requested and self._workers:
+                    self._runtime.status = STATUS_STOPPING
+                    self._runtime.current_phase = "stopping_workers"
                 elif self._workers:
-                    self._runtime.status = STATUS_MANUAL_RUNNING
+                    self._runtime.status = STATUS_STOPPING
+                    self._runtime.current_phase = "stopping_workers"
                 else:
                     self._runtime.status = STATUS_IDLE
+                    self._runtime.current_phase = "idle"
+                return
+            if not controller.get("auto_refill_enabled"):
+                self._runtime.desired_running = True
+                if self._workers or self._runtime.desired_running:
+                    self._runtime.status = STATUS_MANUAL_RUNNING
+                    self._runtime.current_phase = "manual_running"
+                else:
+                    self._runtime.status = STATUS_IDLE
+                    self._runtime.current_phase = "idle"
                 return
             if self._runtime.remote_token_count < int(controller.get("start_threshold", 20)):
                 self._runtime.desired_running = True
@@ -704,8 +743,10 @@ class SingleControllerSupervisor:
                     self._runtime.current_phase = "auto_refill_idle"
             elif self._workers:
                 self._runtime.status = STATUS_AUTO_RUNNING
+                self._runtime.current_phase = "auto_refill_running"
             else:
                 self._runtime.status = STATUS_AUTO_IDLE
+                self._runtime.current_phase = "auto_refill_waiting"
 
     def _launch_workers_if_needed(self) -> None:
         settings = read_settings()
@@ -847,18 +888,24 @@ app = FastAPI(title="Grok Register Console", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
+def _page_context(request: Request, active_page: str) -> dict[str, Any]:
+    return {
+        "request": request,
+        "defaults": json.dumps(merged_defaults(), ensure_ascii=False),
+        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+        "source_project": str(SOURCE_PROJECT),
+        "active_page": active_page,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    return TEMPLATES.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "request": request,
-            "defaults": json.dumps(merged_defaults(), ensure_ascii=False),
-            "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
-            "source_project": str(SOURCE_PROJECT),
-        },
-    )
+    return TEMPLATES.TemplateResponse(request, "index.html", _page_context(request, "controller"))
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request) -> HTMLResponse:
+    return TEMPLATES.TemplateResponse(request, "settings.html", _page_context(request, "settings"))
 
 
 @app.get("/api/meta")
@@ -884,10 +931,16 @@ def get_settings() -> dict[str, Any]:
 
 @app.post("/api/settings")
 def save_settings(payload: SystemSettings) -> dict[str, Any]:
-    if payload.concurrency > MAX_CONCURRENT_TASKS:
-        raise HTTPException(status_code=400, detail=f"并发数不能超过控制台上限 {MAX_CONCURRENT_TASKS}")
     saved = write_settings(payload)
     return {"settings": saved, "defaults": merged_defaults()}
+
+
+@app.post("/api/controller/settings")
+def save_controller_settings(payload: ControllerSettingsPayload) -> dict[str, Any]:
+    if payload.concurrency > MAX_CONCURRENT_TASKS:
+        raise HTTPException(status_code=400, detail=f"并发数不能超过控制台上限 {MAX_CONCURRENT_TASKS}")
+    saved = write_controller_settings(payload)
+    return {"settings": saved, "defaults": merged_defaults(), "runtime": supervisor.get_runtime()}
 
 
 @app.get("/api/controller")
@@ -906,7 +959,7 @@ def get_controller_logs(limit: int = Query(300, ge=20, le=2000)) -> dict[str, An
 
 @app.post("/api/controller/start")
 def start_controller() -> dict[str, Any]:
-    supervisor.request_manual_start()
+    supervisor.request_start()
     return {"ok": True, "runtime": supervisor.get_runtime()}
 
 

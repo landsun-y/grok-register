@@ -6,15 +6,17 @@
   <title>Grok Register Console</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
+<body data-page="controller">
   <div id="app" class="shell">
     <header class="topbar">
       <div class="brand">
         <div class="brand-kicker">Unified Console</div>
         <h1>Grok Register</h1>
-        <p>单控制器补号面板。手动开始/停止与自动补号共用一套配置，内部按并发数启动 worker。</p>
+        <p>运行控制页采用左右布局，左侧只保留关键状态、总开关和常用设置，右侧显示实时控制台日志。</p>
       </div>
       <div class="topbar-meta">
+        <a class="nav-link{% if active_page == "controller" %} active{% endif %}" href="/">运行控制</a>
+        <a class="nav-link{% if active_page == "settings" %} active{% endif %}" href="/settings">系统配置 / 健康检查</a>
         <div class="meta-card">
           <div class="meta-label">Source</div>
           <div class="meta-value">{{ source_project }}</div>
@@ -27,132 +29,69 @@
     </header>
 
     <main class="main">
-      <section class="panel panel-settings">
-        <div class="panel-head">
-          <div>
-            <div class="eyebrow">System Settings</div>
-            <h2>系统默认配置</h2>
-            <p class="panel-desc">保存全局网络、邮箱、sink 和自动补号配置。开始/停止都基于这一套参数运行。</p>
-          </div>
-          <button id="toggleSettingsBtn" class="button button-secondary" type="button">展开系统默认配置</button>
-        </div>
-
-        <form id="settingsForm" class="task-form hidden">
-          <label>
-            <span>浏览器代理</span>
-            <small>浏览器访问 x.ai 时走的代理。</small>
-            <input name="browser_proxy" placeholder="例如 http://127.0.0.1:18118">
-          </label>
-          <label>
-            <span>请求代理</span>
-            <small>邮箱 API 等普通 HTTP 请求走的代理。</small>
-            <input name="proxy" placeholder="例如 socks5://127.0.0.1:1080">
-          </label>
-          <label>
-            <span>邮箱 API Base</span>
-            <small>临时邮箱服务接口地址。</small>
-            <input name="temp_mail_api_base" placeholder="https://api.example.com/api/v1">
-          </label>
-          <label>
-            <span>邮箱域名</span>
-            <small>可填单个或多个域名，逗号分隔。</small>
-            <input name="temp_mail_domain" placeholder="example.com,example.org">
-          </label>
-          <label>
-            <span>邮箱管理口令</span>
-            <small>创建邮箱时使用的管理口令或 API Key。</small>
-            <input name="temp_mail_admin_password" placeholder="admin password">
-          </label>
-          <label>
-            <span>站点密码</span>
-            <small>仅邮箱 API 额外要求站点鉴权时填写。</small>
-            <input name="temp_mail_site_password" placeholder="optional">
-          </label>
-          <label>
-            <span>Token 上传接口</span>
-            <small>grok2api 管理接口地址。</small>
-            <input name="api_endpoint" placeholder="http://127.0.0.1:8000/v1/admin/tokens">
-          </label>
-          <label>
-            <span>API Token</span>
-            <small>调用 grok2api 管理接口时使用的口令。</small>
-            <input name="api_token" placeholder="bearer token">
-          </label>
-          <label class="checkbox-row">
-            <input name="api_append" type="checkbox" checked>
-            <span>追加写入 token</span>
-          </label>
-          <label>
-            <span>并发数</span>
-            <small>内部同时运行多少个 worker。</small>
-            <input name="concurrency" type="number" min="1" max="32">
-          </label>
-          <label class="checkbox-row">
-            <input name="auto_refill_enabled" type="checkbox">
-            <span>开启自动补号</span>
-          </label>
-          <label>
-            <span>启动阈值</span>
-            <small>远端账号数低于这个值时自动开始补号。</small>
-            <input name="start_threshold" type="number" min="0">
-          </label>
-          <label>
-            <span>停止阈值</span>
-            <small>补到这个值或以上时自动停止补号。</small>
-            <input name="stop_threshold" type="number" min="1">
-          </label>
-          <label>
-            <span>分批发送数量</span>
-            <small>每成功多少个账号就推送一次。</small>
-            <input name="push_batch_size" type="number" min="1">
-          </label>
-          <label>
-            <span>检测周期</span>
-            <small>每隔多少秒查询一次 grok2api 当前账号数。</small>
-            <input name="poll_interval_sec" type="number" min="5">
-          </label>
-          <div class="form-actions full">
-            <button class="button" type="submit">保存默认配置</button>
-            <div id="settingsMessage" class="form-message"></div>
-          </div>
-        </form>
-      </section>
-
-      <section class="panel panel-health">
-        <div class="panel-head">
-          <div>
-            <div class="eyebrow">Health Check</div>
-            <h2>环境健康检查</h2>
-            <p class="panel-desc">使用当前系统默认配置检查 `warp / grok2api / temp mail / x.ai` 连通性。</p>
-          </div>
-          <button id="healthRefreshBtn" class="button button-secondary" type="button">重新检测</button>
-        </div>
-        <div id="healthMeta" class="health-meta">等待检测</div>
-        <div id="healthGrid" class="health-grid"></div>
-      </section>
-
-      <section class="workspace controller-layout">
-        <section class="panel panel-controller">
+      <section class="workspace workspace-controller">
+        <section class="panel panel-controller-side">
           <div class="panel-head">
             <div>
               <div class="eyebrow">Controller</div>
               <h2>单控制器</h2>
-              <p class="panel-desc">手动开始后会持续补号；若开启自动补号，则会按阈值自动启停。</p>
+              <p class="panel-desc">总开关开启后才会根据自动补号配置决定是否按阈值自动补号。</p>
             </div>
             <div class="button-row">
+              <button id="masterToggleBtn" class="button" type="button">开始</button>
               <button id="manualCheckBtn" class="button button-secondary" type="button">立即检测一次</button>
-              <button id="startBtn" class="button" type="button">开始</button>
-              <button id="stopBtn" class="button button-danger" type="button">停止</button>
+              <button id="toggleControllerSettingsBtn" class="button button-secondary" type="button">设置</button>
             </div>
           </div>
-          <div id="controllerSummary" class="summary-grid"></div>
+
+          <div id="controllerMessage" class="form-message"></div>
+          <div id="controllerSummary" class="summary-grid summary-grid-compact"></div>
         </section>
+
+        <div id="controllerSettingsModal" class="modal hidden" hidden>
+          <div id="controllerSettingsBackdrop" class="modal-backdrop"></div>
+          <div class="modal-dialog">
+            <div class="panel-head modal-head">
+              <div>
+                <div class="eyebrow">Controller Settings</div>
+                <h2>控制器设置</h2>
+                <p class="panel-desc">这里调整自动补号、并发数和阈值，不会影响系统默认配置页。</p>
+              </div>
+              <button id="closeControllerSettingsBtn" class="button button-secondary" type="button">关闭</button>
+            </div>
+            <form id="controllerSettingsForm" class="task-form controller-settings-form">
+              <label class="checkbox-row full">
+                <input name="auto_refill_enabled" type="checkbox">
+                <span>开启自动补号</span>
+              </label>
+              <label>
+                <span>并发数</span>
+                <small>内部同时运行多少个 worker。</small>
+                <input name="concurrency" type="number" min="1" max="32">
+              </label>
+              <label>
+                <span>启动阈值</span>
+                <small>远端账号数低于该值时自动开始补号。</small>
+                <input name="start_threshold" type="number" min="0">
+              </label>
+              <label>
+                <span>停止阈值</span>
+                <small>远端账号数达到该值时自动停止补号。</small>
+                <input name="stop_threshold" type="number" min="1">
+              </label>
+              <div class="form-actions full">
+                <button class="button" type="submit">保存控制设置</button>
+              </div>
+            </form>
+          </div>
+        </div>
 
         <section class="panel panel-detail">
           <div class="panel-head">
             <div>
               <div class="eyebrow">Live Console</div>
               <h2>控制器日志</h2>
+              <p class="panel-desc">只显示启动、停止、成功、失败和推送等关键事件，远端账号数轮询不会再刷屏。</p>
             </div>
           </div>
           <div class="console-wrap">

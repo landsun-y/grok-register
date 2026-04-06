@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grok Register Console</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-page="settings">
+  <div id="app" class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-kicker">Unified Console</div>
+        <h1>Grok Register</h1>
+        <p>系统默认配置与环境健康检查集中在这个页面，常改的运行参数已移到运行控制页左侧设置区。</p>
+      </div>
+      <div class="topbar-meta">
+        <a class="nav-link{% if active_page == "controller" %} active{% endif %}" href="/">运行控制</a>
+        <a class="nav-link{% if active_page == "settings" %} active{% endif %}" href="/settings">系统配置 / 健康检查</a>
+        <div class="meta-card">
+          <div class="meta-label">Source</div>
+          <div class="meta-value">{{ source_project }}</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">并发上限</div>
+          <div class="meta-value">{{ max_concurrent_tasks }}</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel panel-settings">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">System Settings</div>
+            <h2>系统默认配置</h2>
+            <p class="panel-desc">这里只保留稳定的网络、邮箱和 sink 参数；自动补号与阈值设置请到运行控制页调整。</p>
+          </div>
+        </div>
+
+        <form id="settingsForm" class="task-form">
+          <label>
+            <span>浏览器代理</span>
+            <small>浏览器访问 x.ai 时走的代理。</small>
+            <input name="browser_proxy" placeholder="例如 http://127.0.0.1:18118">
+          </label>
+          <label>
+            <span>请求代理</span>
+            <small>邮箱 API 等普通 HTTP 请求走的代理。</small>
+            <input name="proxy" placeholder="例如 socks5://127.0.0.1:1080">
+          </label>
+          <label>
+            <span>邮箱 API Base</span>
+            <small>临时邮箱服务接口地址。</small>
+            <input name="temp_mail_api_base" placeholder="https://api.example.com/api/v1">
+          </label>
+          <label>
+            <span>邮箱域名</span>
+            <small>可填单个或多个域名，逗号分隔。</small>
+            <input name="temp_mail_domain" placeholder="example.com,example.org">
+          </label>
+          <label>
+            <span>邮箱管理口令</span>
+            <small>创建邮箱时使用的管理口令或 API Key。</small>
+            <input name="temp_mail_admin_password" placeholder="admin password">
+          </label>
+          <label>
+            <span>站点密码</span>
+            <small>仅邮箱 API 额外要求站点鉴权时填写。</small>
+            <input name="temp_mail_site_password" placeholder="optional">
+          </label>
+          <label>
+            <span>Token 上传接口</span>
+            <small>grok2api 管理接口地址。</small>
+            <input name="api_endpoint" placeholder="http://127.0.0.1:8000/v1/admin/tokens">
+          </label>
+          <label>
+            <span>API Token</span>
+            <small>调用 grok2api 管理接口时使用的口令。</small>
+            <input name="api_token" placeholder="bearer token">
+          </label>
+          <label class="checkbox-row">
+            <input name="api_append" type="checkbox" checked>
+            <span>追加写入 token</span>
+          </label>
+          <label>
+            <span>分批发送数量</span>
+            <small>每成功多少个账号就推送一次。</small>
+            <input name="push_batch_size" type="number" min="1">
+          </label>
+          <label>
+            <span>检测周期</span>
+            <small>每隔多少秒查询一次 grok2api 当前账号数。</small>
+            <input name="poll_interval_sec" type="number" min="5">
+          </label>
+          <div class="form-actions full">
+            <button class="button" type="submit">保存默认配置</button>
+            <div id="settingsMessage" class="form-message"></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-health">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Health Check</div>
+            <h2>环境健康检查</h2>
+            <p class="panel-desc">使用当前系统默认配置检查 `warp / grok2api / temp mail / x.ai` 连通性。</p>
+          </div>
+          <button id="healthRefreshBtn" class="button button-secondary" type="button">重新检测</button>
+        </div>
+        <div id="healthMeta" class="health-meta">等待检测</div>
+        <div id="healthGrid" class="health-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.__DEFAULTS__ = {{ defaults|safe }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
