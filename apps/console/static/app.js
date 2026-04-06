@@ -146,8 +146,8 @@
         ${row.map(([label, value, inline]) => `
           <div class="summary-item${inline ? " summary-item-inline" : ""}">
             ${inline
-              ? `<div class="summary-inline-row"><span class="meta-item-label summary-inline-label">${escapeHtml(label)}</span><span class="meta-item-value summary-inline-content">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</span></div>`
-              : `<div class="meta-item-label">${escapeHtml(label)}</div><div class="meta-item-value">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</div>`}
+              ? `<div class="summary-inline-row"><span class="meta-item-label summary-inline-label">${escapeHtml(label)}</span><span class="meta-item-value summary-inline-content">${typeof value === "string" && value.startsWith("<") ? value : escapeHtml(value)}</span></div>`
+              : `<div class="meta-item-label">${escapeHtml(label)}</div><div class="meta-item-value">${typeof value === "string" && value.startsWith("<") ? value : escapeHtml(value)}</div>`}
           </div>
         `).join("")}
       </div>
