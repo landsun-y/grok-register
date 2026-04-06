@@ -305,6 +305,7 @@ class WorkerProcess:
     started_at: str
     log_handle: Any
     collected_lines: int = 0
+    console_scanned_lines: int = 0
 
 
 @dataclass
@@ -640,34 +641,73 @@ class SingleControllerSupervisor:
         worker.collected_lines = len(lines)
         return [line.strip() for line in new_lines if line.strip()]
 
+    def _scan_worker_console(self, worker: "WorkerProcess") -> None:
+        """Incrementally scan worker stdout log for round-level events."""
+        if not worker.console_path.exists():
+            return
+        try:
+            all_lines = worker.console_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return
+        new_lines = all_lines[worker.console_scanned_lines:]
+        worker.console_scanned_lines = len(all_lines)
+
+        slot = worker.slot
+        for raw in new_lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if "开始第" in line and "轮注册" in line:
+                m = re.search(r"开始第\s*(\d+)\s*轮注册", line)
+                round_num = m.group(1) if m else "?"
+                self.append_log(f"[worker-{slot}] 开始第 {round_num} 轮注册")
+            elif "本轮注册完成，邮箱:" in line:
+                email = line.split("邮箱:")[-1].strip()
+                with self._lock:
+                    self._runtime.last_email = email
+                self.append_log(f"[worker-{slot}] 注册完成 email={email}")
+            elif "[Error]" in line and "轮失败:" in line:
+                m = re.search(r"第\s*(\d+)\s*轮失败:\s*(.*)", line)
+                if m:
+                    round_num, error_msg = m.group(1), m.group(2).strip()
+                else:
+                    round_num, error_msg = "?", line
+                with self._lock:
+                    self._runtime.failed_count += 1
+                    self._runtime.last_error = error_msg
+                self.append_log(f"[worker-{slot}] 第 {round_num} 轮失败: {error_msg}")
+
     def _refresh_workers(self) -> None:
         for slot, worker in list(self._workers.items()):
+            self._scan_worker_console(worker)
+
             new_tokens = self._collect_new_tokens(worker)
             if new_tokens:
-                with self._lock:
-                    for token in new_tokens:
+                for token in new_tokens:
+                    with self._lock:
                         self._runtime.pending_tokens.append(token)
                         self._runtime.completed_count += 1
                         self._runtime.current_round += 1
-                    self._runtime.current_phase = "worker_succeeded"
-                self.append_log(f"[worker-{slot}] 成功 +{len(new_tokens)} token")
+                        self._runtime.current_phase = "worker_succeeded"
+                    short_token = token[:16] + "..." if len(token) > 16 else token
+                    self.append_log(f"[worker-{slot}] 收集 token={short_token}")
 
         finished_slots: list[int] = []
         for slot, worker in list(self._workers.items()):
             exit_code = worker.process.poll()
             if exit_code is None:
                 continue
+            self._scan_worker_console(worker)
             self._collect_new_tokens(worker)
             if exit_code != 0:
                 result = self._read_worker_result(worker.result_path)
                 error = str(result.get("error", f"worker exited with {exit_code}"))
                 with self._lock:
-                    self._runtime.failed_count += 1
                     self._runtime.last_error = error
                     self._runtime.current_phase = "worker_failed"
-                self.append_log(f"[worker-{slot}] 异常退出: {error}")
+                self.append_log(f"[worker-{slot}] 进程异常退出(code={exit_code}): {error}")
             else:
-                self.append_log(f"[worker-{slot}] 已退出")
+                self.append_log(f"[worker-{slot}] 进程已退出")
             finished_slots.append(slot)
             try:
                 worker.log_handle.close()
@@ -838,7 +878,7 @@ class SingleControllerSupervisor:
             if p.exists():
                 p.unlink()
         console_path = task_dir / "console.log"
-        log_handle = console_path.open("a", encoding="utf-8")
+        log_handle = console_path.open("w", encoding="utf-8")
         command = [
             str(SOURCE_VENV_PYTHON),
             str(task_dir / "DrissionPage_example.py"),
@@ -852,6 +892,7 @@ class SingleControllerSupervisor:
             "--worker-name",
             f"worker-{slot}",
         ]
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         process = subprocess.Popen(
             command,
             cwd=task_dir,
@@ -859,6 +900,7 @@ class SingleControllerSupervisor:
             stderr=subprocess.STDOUT,
             start_new_session=True,
             text=True,
+            env=env,
         )
         self._workers[slot] = WorkerProcess(
             slot=slot,
