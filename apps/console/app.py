@@ -419,14 +419,15 @@ def merged_defaults() -> dict[str, Any]:
     base["api"] = api_base
 
     controller = dict(base.get("controller") or {})
-    for key in ("concurrency", "auto_refill_enabled", "start_threshold", "stop_threshold", "push_batch_size", "poll_interval_sec"):
+    for key in ("concurrency", "auto_refill_enabled", "single_batch_count", "start_threshold", "stop_threshold", "push_batch_size", "poll_interval_sec"):
         if key in saved:
             controller[key] = saved[key]
     controller["concurrency"] = max(1, min(int(controller.get("concurrency", 1)), MAX_CONCURRENT_TASKS))
+    controller["single_batch_count"] = max(1, int(controller.get("single_batch_count", 10)))
     controller["push_batch_size"] = max(1, int(controller.get("push_batch_size", 10)))
     controller["poll_interval_sec"] = max(5, int(controller.get("poll_interval_sec", 30)))
     controller["start_threshold"] = max(0, int(controller.get("start_threshold", 20)))
-    controller["stop_threshold"] = max(controller["start_threshold"] + 1, int(controller.get("stop_threshold", 50)))
+    controller["stop_threshold"] = max(1, int(controller.get("stop_threshold", 50)))
     controller["auto_refill_enabled"] = bool(controller.get("auto_refill_enabled", False))
     base["controller"] = controller
     return base
