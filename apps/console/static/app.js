@@ -1,27 +1,19 @@
 (function () {
   const state = {
-    tasks: [],
-    selectedTaskId: null,
+    runtime: null,
   };
 
-  const taskListEl = document.getElementById("taskList");
-  const detailTitleEl = document.getElementById("detailTitle");
-  const detailMetaEl = document.getElementById("detailMeta");
-  const detailSummaryEl = document.getElementById("detailSummary");
-  const consoleOutputEl = document.getElementById("consoleOutput");
-  const formEl = document.getElementById("taskForm");
   const settingsFormEl = document.getElementById("settingsForm");
-  const formMessageEl = document.getElementById("formMessage");
   const settingsMessageEl = document.getElementById("settingsMessage");
-  const stopBtnEl = document.getElementById("stopBtn");
-  const refreshBtnEl = document.getElementById("refreshBtn");
-  const healthRefreshBtnEl = document.getElementById("healthRefreshBtn");
   const toggleSettingsBtnEl = document.getElementById("toggleSettingsBtn");
-  const toggleAdvancedBtnEl = document.getElementById("toggleAdvancedBtn");
-  const toggleMailBtnEl = document.getElementById("toggleMailBtn");
-  const advancedFieldsEl = document.getElementById("advancedFields");
+  const healthRefreshBtnEl = document.getElementById("healthRefreshBtn");
   const healthGridEl = document.getElementById("healthGrid");
   const healthMetaEl = document.getElementById("healthMeta");
+  const controllerSummaryEl = document.getElementById("controllerSummary");
+  const consoleOutputEl = document.getElementById("consoleOutput");
+  const startBtnEl = document.getElementById("startBtn");
+  const stopBtnEl = document.getElementById("stopBtn");
+  const manualCheckBtnEl = document.getElementById("manualCheckBtn");
 
   function escapeHtml(value) {
     return String(value || "")
@@ -30,10 +22,17 @@
       .replaceAll(">", "&gt;");
   }
 
+  function statusClass(status) {
+    return `status-pill status-${status || "unknown"}`;
+  }
+
+  function healthClass(ok) {
+    return ok ? "health-pill health-ok" : "health-pill health-bad";
+  }
+
   function setDefaults() {
     const defaults = window.__DEFAULTS__ || {};
-    formEl.elements.name.value = `grok-task-${Date.now()}`;
-    formEl.elements.count.value = defaults.run?.count || 50;
+    const controller = defaults.controller || {};
     settingsFormEl.elements.proxy.value = defaults.proxy || "";
     settingsFormEl.elements.browser_proxy.value = defaults.browser_proxy || "";
     settingsFormEl.elements.temp_mail_api_base.value = defaults.temp_mail_api_base || "";
@@ -43,15 +42,12 @@
     settingsFormEl.elements.api_endpoint.value = defaults.api?.endpoint || "";
     settingsFormEl.elements.api_token.value = defaults.api?.token || "";
     settingsFormEl.elements.api_append.checked = defaults.api?.append !== false;
-    formEl.elements.api_append.checked = false;
-  }
-
-  function statusClass(status) {
-    return `status-pill status-${status || "unknown"}`;
-  }
-
-  function healthClass(ok) {
-    return ok ? "health-pill health-ok" : "health-pill health-bad";
+    settingsFormEl.elements.concurrency.value = controller.concurrency || 1;
+    settingsFormEl.elements.auto_refill_enabled.checked = Boolean(controller.auto_refill_enabled);
+    settingsFormEl.elements.start_threshold.value = controller.start_threshold || 20;
+    settingsFormEl.elements.stop_threshold.value = controller.stop_threshold || 50;
+    settingsFormEl.elements.push_batch_size.value = controller.push_batch_size || 10;
+    settingsFormEl.elements.poll_interval_sec.value = controller.poll_interval_sec || 30;
   }
 
   function renderHealth(data) {
@@ -74,96 +70,37 @@
     `).join("");
   }
 
-  function renderTaskList() {
-    if (!state.tasks.length) {
-      taskListEl.innerHTML = '<div class="empty">暂无任务</div>';
+  function renderRuntime(runtime) {
+    if (!runtime) {
+      controllerSummaryEl.innerHTML = '<div class="empty">暂无控制器状态</div>';
       return;
     }
-
-    taskListEl.innerHTML = state.tasks.map((task) => `
-      <button class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}" data-task-id="${task.id}">
-        <div class="task-row">
-          <strong title="${escapeHtml(task.name)}">#${task.id} ${escapeHtml(task.name)}</strong>
-          <span class="${statusClass(task.status)}">${escapeHtml(task.status)}</span>
-        </div>
-        <div class="task-subrow">执行次数 ${task.target_count}</div>
-        <div class="task-actions">
-          <span class="task-action-hint">点击查看日志</span>
-          <button class="button button-danger button-small" type="button" data-delete-task-id="${task.id}">删除</button>
-        </div>
-      </button>
-    `).join("");
-
-    taskListEl.querySelectorAll("[data-task-id]").forEach((button) => {
-      button.addEventListener("click", () => {
-        state.selectedTaskId = Number(button.dataset.taskId);
-        renderTaskList();
-        refreshDetail();
-      });
-    });
-
-    taskListEl.querySelectorAll("[data-delete-task-id]").forEach((button) => {
-      button.addEventListener("click", async (event) => {
-        event.stopPropagation();
-        const taskId = Number(button.dataset.deleteTaskId);
-        const confirmed = window.confirm(`确认删除任务 #${taskId} 吗？`);
-        if (!confirmed) return;
-        try {
-          await fetchJson(`/api/tasks/${taskId}`, { method: "DELETE" });
-          if (state.selectedTaskId === taskId) {
-            state.selectedTaskId = null;
-            detailTitleEl.textContent = "实时控制台";
-            detailSummaryEl.innerHTML = "";
-            detailMetaEl.innerHTML = "";
-            consoleOutputEl.textContent = "选择任务后显示输出";
-          }
-          await refreshTasks();
-          await refreshDetail();
-        } catch (error) {
-          formMessageEl.textContent = error.message;
-          formMessageEl.className = "form-message error";
-        }
-      });
-    });
-  }
-
-  function renderTaskDetail(task) {
-    detailTitleEl.textContent = `任务 #${task.id} · ${task.name}`;
-    stopBtnEl.disabled = !["queued", "running", "stopping"].includes(task.status);
-    detailSummaryEl.innerHTML = [
-      ["状态", task.status],
-      ["目标次数", task.target_count],
-      ["成功数", task.completed_count],
-      ["失败数", task.failed_count],
-      ["当前轮次", task.current_round],
-      ["当前阶段", task.current_phase || "-"],
+    state.runtime = runtime;
+    controllerSummaryEl.innerHTML = [
+      ["状态", `<span class="${statusClass(runtime.status)}">${escapeHtml(runtime.status)}</span>`],
+      ["远端账号数", runtime.remote_token_count],
+      ["活跃 worker", runtime.current_running_workers],
+      ["累计成功", runtime.completed_count],
+      ["累计失败", runtime.failed_count],
+      ["已完成轮次", runtime.current_round],
+      ["待推送数", runtime.pending_token_count],
+      ["累计推送数", runtime.total_pushed_count],
+      ["当前阶段", runtime.current_phase || "-"],
+      ["最近邮箱", runtime.last_email || "-"],
+      ["最近错误", runtime.last_error || "-"],
+      ["最近检测", runtime.last_check_at || "-"],
+      ["最近推送", runtime.last_push_at || "-"],
+      ["推送结果", runtime.last_push_result || "-"],
+      ["最近开始", runtime.last_started_at || "-"],
+      ["最近停止", runtime.last_stopped_at || "-"],
     ].map(([label, value]) => `
       <div class="summary-item">
         <div class="meta-item-label">${escapeHtml(label)}</div>
-        <div class="meta-item-value">${escapeHtml(value)}</div>
+        <div class="meta-item-value">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</div>
       </div>
     `).join("");
-
-    const cfg = task.config || {};
-    detailMetaEl.innerHTML = [
-      ["邮箱 API Base", cfg.temp_mail_api_base || "-"],
-      ["邮箱域名", cfg.temp_mail_domain || "-"],
-      ["邮箱管理密码", cfg.temp_mail_admin_password || "-"],
-      ["站点密码", cfg.temp_mail_site_password || "-"],
-      ["请求代理", cfg.proxy || "-"],
-      ["浏览器代理", cfg.browser_proxy || "-"],
-      ["最近邮箱", task.last_email || "-"],
-      ["最近错误", task.last_error || "-"],
-      ["创建时间", task.created_at || "-"],
-      ["开始时间", task.started_at || "-"],
-      ["结束时间", task.finished_at || "-"],
-      ["PID", task.pid || "-"],
-    ].map(([label, value]) => `
-      <div class="meta-item">
-        <div class="meta-item-label">${escapeHtml(label)}</div>
-        <div class="meta-item-value">${escapeHtml(value)}</div>
-      </div>
-    `).join("");
+    startBtnEl.disabled = runtime.status === "manual_running" || runtime.status === "auto_running";
+    stopBtnEl.disabled = runtime.status === "idle" || runtime.status === "auto_idle";
   }
 
   async function fetchJson(url, options) {
@@ -173,36 +110,6 @@
       throw new Error(data.detail || "Request failed");
     }
     return data;
-  }
-
-  async function refreshTasks() {
-    const data = await fetchJson("/api/tasks");
-    state.tasks = data.tasks || [];
-    if (!state.selectedTaskId && state.tasks.length) {
-      state.selectedTaskId = state.tasks[0].id;
-    }
-    renderTaskList();
-  }
-
-  async function refreshDetail() {
-    if (!state.selectedTaskId) {
-      return;
-    }
-    const taskData = await fetchJson(`/api/tasks/${state.selectedTaskId}`);
-    renderTaskDetail(taskData.task);
-    const logData = await fetchJson(`/api/tasks/${state.selectedTaskId}/logs?limit=250`);
-    consoleOutputEl.innerHTML = escapeHtml((logData.lines || []).join("\n"));
-    consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
-  }
-
-  async function refreshAll() {
-    try {
-      await refreshTasks();
-      await refreshDetail();
-    } catch (error) {
-      formMessageEl.textContent = error.message;
-      formMessageEl.className = "form-message error";
-    }
   }
 
   async function refreshHealth() {
@@ -216,52 +123,27 @@
     }
   }
 
-  formEl.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const payload = {
-      name: formEl.elements.name.value.trim(),
-      count: Number(formEl.elements.count.value),
-      proxy: formEl.elements.proxy.value.trim() || null,
-      browser_proxy: formEl.elements.browser_proxy.value.trim() || null,
-      temp_mail_api_base: formEl.elements.temp_mail_api_base.value.trim() || null,
-      temp_mail_admin_password: formEl.elements.temp_mail_admin_password.value.trim() || null,
-      temp_mail_domain: formEl.elements.temp_mail_domain.value.trim() || null,
-      temp_mail_site_password: formEl.elements.temp_mail_site_password.value.trim() || null,
-      api_endpoint: formEl.elements.api_endpoint.value.trim() || null,
-      api_token: formEl.elements.api_token.value.trim() || null,
-      api_append: formEl.elements.api_append.checked ? true : null,
-    };
-    try {
-      const data = await fetchJson("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      state.selectedTaskId = data.task.id;
-      formMessageEl.textContent = `任务 #${data.task.id} 已创建`;
-      formMessageEl.className = "form-message success";
-      await refreshAll();
-    } catch (error) {
-      formMessageEl.textContent = error.message;
-      formMessageEl.className = "form-message error";
-    }
-  });
+  async function refreshController() {
+    const data = await fetchJson("/api/controller");
+    renderRuntime(data.runtime || null);
+  }
 
-  stopBtnEl.addEventListener("click", async () => {
-    if (!state.selectedTaskId) {
-      return;
-    }
-    try {
-      await fetchJson(`/api/tasks/${state.selectedTaskId}/stop`, { method: "POST" });
-      await refreshAll();
-    } catch (error) {
-      formMessageEl.textContent = error.message;
-      formMessageEl.className = "form-message error";
-    }
-  });
+  async function refreshLogs() {
+    const data = await fetchJson("/api/controller/logs?limit=400");
+    consoleOutputEl.innerHTML = escapeHtml((data.lines || []).join("
+"));
+    consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
+  }
 
-  refreshBtnEl.addEventListener("click", refreshAll);
-  healthRefreshBtnEl.addEventListener("click", refreshHealth);
+  async function refreshAll() {
+    try {
+      await refreshController();
+      await refreshLogs();
+    } catch (error) {
+      settingsMessageEl.textContent = error.message;
+      settingsMessageEl.className = "form-message error";
+    }
+  }
 
   settingsFormEl.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -275,6 +157,12 @@
       api_endpoint: settingsFormEl.elements.api_endpoint.value.trim(),
       api_token: settingsFormEl.elements.api_token.value.trim(),
       api_append: settingsFormEl.elements.api_append.checked,
+      concurrency: Number(settingsFormEl.elements.concurrency.value),
+      auto_refill_enabled: settingsFormEl.elements.auto_refill_enabled.checked,
+      start_threshold: Number(settingsFormEl.elements.start_threshold.value),
+      stop_threshold: Number(settingsFormEl.elements.stop_threshold.value),
+      push_batch_size: Number(settingsFormEl.elements.push_batch_size.value),
+      poll_interval_sec: Number(settingsFormEl.elements.poll_interval_sec.value),
     };
     try {
       const data = await fetchJson("/api/settings", {
@@ -287,15 +175,11 @@
       settingsMessageEl.className = "form-message success";
       setDefaults();
       await refreshHealth();
+      await refreshAll();
     } catch (error) {
       settingsMessageEl.textContent = error.message;
       settingsMessageEl.className = "form-message error";
     }
-  });
-
-  toggleAdvancedBtnEl.addEventListener("click", () => {
-    advancedFieldsEl.classList.toggle("hidden");
-    toggleAdvancedBtnEl.textContent = advancedFieldsEl.classList.contains("hidden") ? "高级设置" : "收起高级设置";
   });
 
   toggleSettingsBtnEl.addEventListener("click", () => {
@@ -303,14 +187,41 @@
     toggleSettingsBtnEl.textContent = settingsFormEl.classList.contains("hidden") ? "展开系统默认配置" : "收起系统默认配置";
   });
 
-  toggleMailBtnEl.addEventListener("click", () => {
-    detailMetaEl.classList.toggle("hidden");
-    toggleMailBtnEl.textContent = detailMetaEl.classList.contains("hidden") ? "展开临时邮箱参数" : "收起临时邮箱参数";
+  startBtnEl.addEventListener("click", async () => {
+    try {
+      await fetchJson("/api/controller/start", { method: "POST" });
+      await refreshAll();
+    } catch (error) {
+      settingsMessageEl.textContent = error.message;
+      settingsMessageEl.className = "form-message error";
+    }
   });
+
+  stopBtnEl.addEventListener("click", async () => {
+    try {
+      await fetchJson("/api/controller/stop", { method: "POST" });
+      await refreshAll();
+    } catch (error) {
+      settingsMessageEl.textContent = error.message;
+      settingsMessageEl.className = "form-message error";
+    }
+  });
+
+  manualCheckBtnEl.addEventListener("click", async () => {
+    try {
+      await fetchJson("/api/controller/check", { method: "POST" });
+      await refreshAll();
+    } catch (error) {
+      settingsMessageEl.textContent = error.message;
+      settingsMessageEl.className = "form-message error";
+    }
+  });
+
+  healthRefreshBtnEl.addEventListener("click", refreshHealth);
 
   setDefaults();
   refreshHealth();
   refreshAll();
-  window.setInterval(refreshAll, 2000);
+  window.setInterval(refreshAll, 2500);
   window.setInterval(refreshHealth, 15000);
 })();

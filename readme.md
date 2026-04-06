@@ -120,6 +120,14 @@ python DrissionPage_example.py --count 1
     "endpoint": "http://127.0.0.1:8000/v1/admin/tokens",
     "token": "",
     "append": true
+  },
+  "controller": {
+    "concurrency": 2,
+    "auto_refill_enabled": false,
+    "start_threshold": 20,
+    "stop_threshold": 50,
+    "push_batch_size": 10,
+    "poll_interval_sec": 30
   }
 }
 ```
@@ -129,6 +137,9 @@ python DrissionPage_example.py --count 1
 - 仓库里提供的是可公开分享的示例配置，不包含任何真实邮箱接口、真实域名、密码或 token
 - 实际运行时，请把你自己的参数写进本机 `config.json` 或控制台系统配置里，不要把生产凭据提交回仓库
 - 代码兼容旧版 `duckmail_*` 字段；现在也原生支持把 DuckMail 直接接到 `temp_mail_*` 这一套字段上
+- 控制台现在是单控制器模式：界面只保留一套默认配置与开始/停止操作，内部按 `controller.concurrency` 启动多个 worker
+- 开启 `controller.auto_refill_enabled` 后，控制台会定期查询 `grok2api` 当前账号数；低于 `start_threshold` 自动开始补号，达到 `stop_threshold` 自动停
+- 注册结果不再等整批结束才一次性发送，而是每累计 `push_batch_size` 个账号就批量推送一次，停止时再补发尾批
 
 ## 文档入口
 
@@ -155,7 +166,7 @@ python DrissionPage_example.py --count 1
 
 - 根目录命令行脚本继续保留，可直接使用
 - 新增控制台和模块目录不会接管你现有生产目录
-- 控制台任务全部运行在 `apps/console/runtime/tasks/` 下的独立目录里
+- 控制台 worker 运行在 `apps/console/runtime/workers/` 下的独立目录里
 
 ## 致谢
 

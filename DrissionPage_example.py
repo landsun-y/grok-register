@@ -9,6 +9,7 @@ import time
 import os
 import secrets
 import sys
+import json
 
 from email_register import get_email_and_token, get_oai_code
 
@@ -1187,7 +1188,6 @@ def load_run_count() -> int:
     # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
-        import json
         with open(config_path, "r", encoding="utf-8") as f:
             conf = json.load(f)
         v = conf.get("run", {}).get("count")
@@ -1196,6 +1196,14 @@ def load_run_count() -> int:
     except Exception:
         pass
     return 10
+
+
+def write_result_json(result_path: str, payload: dict) -> None:
+    if not result_path:
+        return
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
 
 def main():
@@ -1209,10 +1217,17 @@ def main():
     parser.add_argument("--count", type=int, default=config_count, help=f"执行轮数，0 表示无限循环（默认读取 config.json run.count，当前 {config_count}）")
     parser.add_argument("--output", default=DEFAULT_SSO_FILE, help="sso 输出 txt 路径")
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
+    parser.add_argument("--result-json", default="", help="单轮结果写入 json 文件")
+    parser.add_argument("--no-api-push", action="store_true", help="结束时不自动推送 API")
+    parser.add_argument("--worker-name", default="", help="日志前缀 worker 名称")
     args = parser.parse_args()
 
+    worker_prefix = f"[{args.worker_name}] " if args.worker_name else ""
     current_round = 0
     collected_sso: list = []
+    last_success_result = None
+    last_error_message = ""
+    interrupted = False
     try:
         start_browser()
         while True:
@@ -1220,18 +1235,20 @@ def main():
                 break
 
             current_round += 1
-            print(f"\n[*] 开始第 {current_round} 轮注册")
-            round_succeeded = False
+            print(f"\n{worker_prefix}[*] 开始第 {current_round} 轮注册")
 
             try:
                 result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
                 collected_sso.append(result["sso"])
-                round_succeeded = True
+                last_success_result = result
             except KeyboardInterrupt:
-                print("\n[Info] 收到中断信号，停止后续轮次。")
+                interrupted = True
+                last_error_message = "收到中断信号，停止后续轮次。"
+                print(f"\n{worker_prefix}[Info] {last_error_message}")
                 break
             except Exception as error:
-                print(f"[Error] 第 {current_round} 轮失败: {error}")
+                last_error_message = str(error)
+                print(f"{worker_prefix}[Error] 第 {current_round} 轮失败: {error}")
             finally:
                 restart_browser()
 
@@ -1239,10 +1256,23 @@ def main():
                 time.sleep(2)
 
     finally:
-        if collected_sso:
-            print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到 API...")
+        if collected_sso and not args.no_api_push:
+            print(f"\n{worker_prefix}[*] 注册完成，推送 {len(collected_sso)} 个 token 到 API...")
             push_sso_to_api(collected_sso)
 
+        result_payload = {
+            "ok": bool(last_success_result),
+            "round": current_round,
+            "email": (last_success_result or {}).get("email", ""),
+            "sso": (last_success_result or {}).get("sso", ""),
+            "given_name": (last_success_result or {}).get("given_name", ""),
+            "family_name": (last_success_result or {}).get("family_name", ""),
+            "password": (last_success_result or {}).get("password", ""),
+            "error": last_error_message,
+            "interrupted": interrupted,
+            "count": len(collected_sso),
+        }
+        write_result_json(args.result_json, result_payload)
         stop_browser()
 
 

@@ -412,3 +412,53 @@ body {
     flex-direction: column;
   }
 }
+
+
+.controller-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.panel-controller .button-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.status-idle,
+.status-auto_idle {
+  background: #ede5d7;
+  color: #6d5a44;
+}
+
+.status-manual_running,
+.status-auto_running {
+  background: #dcefdc;
+  color: var(--success);
+}
+
+.status-stopping {
+  background: #f7ecd0;
+  color: var(--warn);
+}
+
+.status-error {
+  background: #f7d9d3;
+  color: var(--danger);
+}
+
+.button-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}

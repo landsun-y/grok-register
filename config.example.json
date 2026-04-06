@@ -12,5 +12,13 @@
         "endpoint": "http://127.0.0.1:8000/v1/admin/tokens",
         "token": "",
         "append": true
+    },
+    "controller": {
+        "concurrency": 2,
+        "auto_refill_enabled": false,
+        "start_threshold": 20,
+        "stop_threshold": 50,
+        "push_batch_size": 10,
+        "poll_interval_sec": 30
     }
 }

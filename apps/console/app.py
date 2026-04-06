@@ -10,25 +10,23 @@ import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi import Request
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, model_validator
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parents[1]
 RUNTIME_DIR = APP_DIR / "runtime"
-TASKS_DIR = RUNTIME_DIR / "tasks"
+WORKERS_DIR = RUNTIME_DIR / "workers"
 DB_PATH = RUNTIME_DIR / "console.db"
 TEMPLATES = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
@@ -42,20 +40,12 @@ SUPERVISOR_INTERVAL = max(1.0, float(os.getenv("GROK_REGISTER_CONSOLE_POLL_INTER
 PROJECT_FILES = ("DrissionPage_example.py", "email_register.py")
 PROJECT_DIRS = ("turnstilePatch",)
 
-STATUS_QUEUED = "queued"
-STATUS_RUNNING = "running"
+STATUS_IDLE = "idle"
+STATUS_MANUAL_RUNNING = "manual_running"
+STATUS_AUTO_IDLE = "auto_idle"
+STATUS_AUTO_RUNNING = "auto_running"
 STATUS_STOPPING = "stopping"
-STATUS_COMPLETED = "completed"
-STATUS_PARTIAL = "partial"
-STATUS_FAILED = "failed"
-STATUS_STOPPED = "stopped"
-
-LINE_RE_ROUND = re.compile(r"开始第\s*(\d+)\s*轮注册")
-LINE_RE_SUCCESS = re.compile(r"注册成功\s*\|\s*email=([^|\s]+)")
-LINE_RE_ERROR = re.compile(r"\[Error\]\s*第\s*(\d+)\s*轮失败:\s*(.+)")
-LINE_RE_TEMP_EMAIL = re.compile(r"临时邮箱创建成功:\s*([^\s]+)")
-LINE_RE_FILLED_EMAIL = re.compile(r"已填写邮箱并点击注册:\s*([^\s]+)")
-LINE_RE_PUSH = re.compile(r"SSO token 已推送到 API")
+STATUS_ERROR = "error"
 
 db_lock = threading.RLock()
 
@@ -66,7 +56,7 @@ def now_iso() -> str:
 
 def ensure_dirs() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKERS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -75,21 +65,9 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def fetch_all(query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    with db_lock, get_conn() as conn:
-        return conn.execute(query, params).fetchall()
-
-
 def fetch_one(query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
     with db_lock, get_conn() as conn:
         return conn.execute(query, params).fetchone()
-
-
-def execute(query: str, params: tuple[Any, ...] = ()) -> int:
-    with db_lock, get_conn() as conn:
-        cur = conn.execute(query, params)
-        conn.commit()
-        return int(cur.lastrowid)
 
 
 def execute_no_return(query: str, params: tuple[Any, ...] = ()) -> None:
@@ -107,29 +85,6 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                target_count INTEGER NOT NULL,
-                completed_count INTEGER NOT NULL DEFAULT 0,
-                failed_count INTEGER NOT NULL DEFAULT 0,
-                current_round INTEGER NOT NULL DEFAULT 0,
-                current_phase TEXT,
-                last_email TEXT,
-                last_error TEXT,
-                last_log_at TEXT,
-                notes TEXT,
-                config_json TEXT NOT NULL,
-                task_dir TEXT NOT NULL,
-                console_path TEXT NOT NULL,
-                pid INTEGER,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT,
-                exit_code INTEGER
             );
             """
         )
@@ -153,6 +108,14 @@ def load_source_defaults() -> dict[str, Any]:
                 "temp_mail_domain": "",
                 "temp_mail_site_password": "",
                 "api": {"endpoint": "", "token": "", "append": True},
+                "controller": {
+                    "concurrency": 1,
+                    "auto_refill_enabled": False,
+                    "start_threshold": 20,
+                    "stop_threshold": 50,
+                    "push_batch_size": 10,
+                    "poll_interval_sec": 30,
+                },
             }
 
     env_count = os.getenv("GROK_REGISTER_DEFAULT_RUN_COUNT", "").strip()
@@ -188,6 +151,15 @@ def load_source_defaults() -> dict[str, Any]:
     if append_env is not None:
         api_base["append"] = append_env.strip().lower() in {"1", "true", "yes", "on"}
     base["api"] = api_base
+
+    controller = dict(base.get("controller") or {})
+    controller.setdefault("concurrency", 1)
+    controller.setdefault("auto_refill_enabled", False)
+    controller.setdefault("start_threshold", 20)
+    controller.setdefault("stop_threshold", 50)
+    controller.setdefault("push_batch_size", 10)
+    controller.setdefault("poll_interval_sec", 30)
+    base["controller"] = controller
     return base
 
 
@@ -217,17 +189,11 @@ def _request_with_optional_proxy(
         headers=headers,
         proxies=proxies,
         allow_redirects=True,
+        verify=False,
     )
 
 
-def _build_health_item(
-    key: str,
-    label: str,
-    ok: bool,
-    summary: str,
-    detail: str,
-    target: str,
-) -> dict[str, Any]:
+def _build_health_item(key: str, label: str, ok: bool, summary: str, detail: str, target: str) -> dict[str, Any]:
     return {
         "key": key,
         "label": label,
@@ -251,23 +217,10 @@ def run_health_checks() -> dict[str, Any]:
 
     warp_target = browser_proxy or request_proxy
     if not warp_target:
-        items.append(
-            _build_health_item(
-                "warp",
-                "WARP / Proxy",
-                False,
-                "未配置代理出口",
-                "当前系统默认配置里没有 `browser_proxy` 或 `proxy`，无法检查前置网络出口。",
-                "-",
-            )
-        )
+        items.append(_build_health_item("warp", "WARP / Proxy", False, "未配置代理出口", "当前系统默认配置里没有 `browser_proxy` 或 `proxy`，无法检查前置网络出口。", "-"))
     else:
         try:
-            response = _request_with_optional_proxy(
-                "https://www.cloudflare.com/cdn-cgi/trace",
-                proxy_url=warp_target,
-                timeout=20,
-            )
+            response = _request_with_optional_proxy("https://www.cloudflare.com/cdn-cgi/trace", proxy_url=warp_target, timeout=20)
             body = response.text
             ip_match = re.search(r"(?m)^ip=(.+)$", body)
             loc_match = re.search(r"(?m)^loc=(.+)$", body)
@@ -275,160 +228,41 @@ def run_health_checks() -> dict[str, Any]:
             ip = ip_match.group(1).strip() if ip_match else "unknown"
             loc = loc_match.group(1).strip() if loc_match else "unknown"
             warp_state = warp_match.group(1).strip() if warp_match else "unknown"
-            ok = response.status_code == 200
-            items.append(
-                _build_health_item(
-                    "warp",
-                    "WARP / Proxy",
-                    ok,
-                    f"HTTP {response.status_code} | IP {ip} | LOC {loc}",
-                    f"通过代理 `{_mask_proxy(warp_target)}` 访问 Cloudflare trace 成功，warp={warp_state}。",
-                    _mask_proxy(warp_target),
-                )
-            )
+            items.append(_build_health_item("warp", "WARP / Proxy", response.status_code == 200, f"HTTP {response.status_code} | IP {ip} | LOC {loc}", f"通过代理 `{_mask_proxy(warp_target)}` 访问 Cloudflare trace 成功，warp={warp_state}。", _mask_proxy(warp_target)))
         except Exception as exc:
-            items.append(
-                _build_health_item(
-                    "warp",
-                    "WARP / Proxy",
-                    False,
-                    "代理出口不可达",
-                    f"通过 `{_mask_proxy(warp_target)}` 访问 Cloudflare trace 失败：{exc}",
-                    _mask_proxy(warp_target),
-                )
-            )
+            items.append(_build_health_item("warp", "WARP / Proxy", False, "代理出口不可达", f"通过 `{_mask_proxy(warp_target)}` 访问 Cloudflare trace 失败：{exc}", _mask_proxy(warp_target)))
 
     if not api_endpoint:
-        items.append(
-            _build_health_item(
-                "grok2api",
-                "grok2api Sink",
-                False,
-                "未配置 token sink",
-                "当前系统默认配置里没有 `api.endpoint`，注册成功后不会自动入池。",
-                "-",
-            )
-        )
+        items.append(_build_health_item("grok2api", "grok2api Sink", False, "未配置 token sink", "当前系统默认配置里没有 `api.endpoint`，注册成功后不会自动入池。", "-"))
     else:
         try:
             response = _request_with_optional_proxy(api_endpoint, timeout=15)
             ok = response.status_code in {200, 401, 403, 405}
-            items.append(
-                _build_health_item(
-                    "grok2api",
-                    "grok2api Sink",
-                    ok,
-                    f"HTTP {response.status_code}",
-                    "接口已可达。即使返回 401/403，也说明服务本身在线，只是需要正确的管理口令。",
-                    api_endpoint,
-                )
-            )
+            items.append(_build_health_item("grok2api", "grok2api Sink", ok, f"HTTP {response.status_code}", "接口已可达。即使返回 401/403，也说明服务本身在线，只是需要正确的管理口令。", api_endpoint))
         except Exception as exc:
-            items.append(
-                _build_health_item(
-                    "grok2api",
-                    "grok2api Sink",
-                    False,
-                    "接口不可达",
-                    f"访问 `{api_endpoint}` 失败：{exc}",
-                    api_endpoint,
-                )
-            )
+            items.append(_build_health_item("grok2api", "grok2api Sink", False, "接口不可达", f"访问 `{api_endpoint}` 失败：{exc}", api_endpoint))
 
     if not temp_mail_api_base:
-        items.append(
-            _build_health_item(
-                "temp_mail",
-                "Temp Mail API",
-                False,
-                "未配置临时邮箱 API",
-                "当前系统默认配置里没有 `temp_mail_api_base`，注册流程会在创建邮箱阶段直接失败。",
-                "-",
-            )
-        )
+        items.append(_build_health_item("temp_mail", "Temp Mail API", False, "未配置临时邮箱 API", "当前系统默认配置里没有 `temp_mail_api_base`，注册流程会在创建邮箱阶段直接失败。", "-"))
     else:
         try:
-            response = _request_with_optional_proxy(
-                temp_mail_api_base,
-                proxy_url=request_proxy,
-                timeout=15,
-            )
-            ok = response.status_code < 500
-            items.append(
-                _build_health_item(
-                    "temp_mail",
-                    "Temp Mail API",
-                    ok,
-                    f"HTTP {response.status_code}",
-                    "接口地址可达。这里只做基础连通性检查，不会真的创建邮箱地址。",
-                    temp_mail_api_base,
-                )
-            )
+            response = _request_with_optional_proxy(temp_mail_api_base, proxy_url=request_proxy, timeout=15)
+            items.append(_build_health_item("temp_mail", "Temp Mail API", response.status_code < 500, f"HTTP {response.status_code}", "接口地址可达。这里只做基础连通性检查，不会真的创建邮箱地址。", temp_mail_api_base))
         except Exception as exc:
-            items.append(
-                _build_health_item(
-                    "temp_mail",
-                    "Temp Mail API",
-                    False,
-                    "接口不可达",
-                    f"访问 `{temp_mail_api_base}` 失败：{exc}",
-                    temp_mail_api_base,
-                )
-            )
+            items.append(_build_health_item("temp_mail", "Temp Mail API", False, "接口不可达", f"访问 `{temp_mail_api_base}` 失败：{exc}", temp_mail_api_base))
 
     xai_proxy = browser_proxy or request_proxy
     try:
-        response = _request_with_optional_proxy(
-            "https://accounts.x.ai/sign-up?redirect=grok-com",
-            proxy_url=xai_proxy,
-            timeout=20,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
+        response = _request_with_optional_proxy("https://accounts.x.ai/sign-up?redirect=grok-com", proxy_url=xai_proxy, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         ok = response.status_code in {200, 301, 302, 303, 307, 308}
         detail = f"使用 `{_mask_proxy(xai_proxy)}` 访问注册页返回 HTTP {response.status_code}。" if xai_proxy else f"直连访问注册页返回 HTTP {response.status_code}。"
         if not ok and response.status_code in {401, 403, 429}:
             detail += " 这通常说明当前出口被目标站点拦截、限流，或还没完成可用的人机验证链路。"
-        items.append(
-            _build_health_item(
-                "xai",
-                "x.ai Sign-up",
-                ok,
-                f"HTTP {response.status_code}",
-                detail,
-                "https://accounts.x.ai/sign-up?redirect=grok-com",
-            )
-        )
+        items.append(_build_health_item("xai", "x.ai Sign-up", ok, f"HTTP {response.status_code}", detail, "https://accounts.x.ai/sign-up?redirect=grok-com"))
     except Exception as exc:
-        items.append(
-            _build_health_item(
-                "xai",
-                "x.ai Sign-up",
-                False,
-                "注册页不可达",
-                f"访问 `x.ai` 注册页失败：{exc}",
-                "https://accounts.x.ai/sign-up?redirect=grok-com",
-            )
-        )
+        items.append(_build_health_item("xai", "x.ai Sign-up", False, "注册页不可达", f"访问 `x.ai` 注册页失败：{exc}", "https://accounts.x.ai/sign-up?redirect=grok-com"))
 
-    return {
-        "items": items,
-        "checked_at": now_iso(),
-    }
-
-
-class TaskCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=120)
-    count: int = Field(50, ge=1, le=5000)
-    proxy: str | None = None
-    browser_proxy: str | None = None
-    temp_mail_api_base: str | None = None
-    temp_mail_admin_password: str | None = None
-    temp_mail_domain: str | None = None
-    temp_mail_site_password: str | None = None
-    api_endpoint: str | None = None
-    api_token: str | None = None
-    api_append: bool | None = None
-    notes: str = ""
+    return {"items": items, "checked_at": now_iso()}
 
 
 class SystemSettings(BaseModel):
@@ -441,13 +275,83 @@ class SystemSettings(BaseModel):
     api_endpoint: str = ""
     api_token: str = ""
     api_append: bool = True
+    concurrency: int = Field(1, ge=1, le=32)
+    auto_refill_enabled: bool = False
+    start_threshold: int = Field(20, ge=0, le=1000000)
+    stop_threshold: int = Field(50, ge=1, le=1000000)
+    push_batch_size: int = Field(10, ge=1, le=10000)
+    poll_interval_sec: int = Field(30, ge=5, le=3600)
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "SystemSettings":
+        if self.start_threshold >= self.stop_threshold:
+            raise ValueError("启动阈值必须小于停止阈值")
+        return self
 
 
 @dataclass
-class ManagedProcess:
-    task_id: int
+class WorkerProcess:
+    slot: int
     process: subprocess.Popen[Any]
+    task_dir: Path
+    console_path: Path
+    result_path: Path
+    output_path: Path
+    started_at: str
     log_handle: Any
+
+
+@dataclass
+class ControllerRuntime:
+    status: str = STATUS_IDLE
+    desired_running: bool = False
+    manual_mode: bool = False
+    stop_requested: bool = False
+    completed_count: int = 0
+    failed_count: int = 0
+    current_round: int = 0
+    current_phase: str = "idle"
+    current_running_workers: int = 0
+    remote_token_count: int = 0
+    pending_token_count: int = 0
+    last_email: str = ""
+    last_error: str = ""
+    last_check_at: str = ""
+    last_push_at: str = ""
+    last_push_result: str = ""
+    last_started_at: str = ""
+    last_stopped_at: str = ""
+    last_worker_started_at: str = ""
+    loop_errors: int = 0
+    total_pushed_count: int = 0
+    worker_seq: int = 0
+    pending_tokens: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "desired_running": self.desired_running,
+            "manual_mode": self.manual_mode,
+            "stop_requested": self.stop_requested,
+            "completed_count": self.completed_count,
+            "failed_count": self.failed_count,
+            "current_round": self.current_round,
+            "current_phase": self.current_phase,
+            "current_running_workers": self.current_running_workers,
+            "remote_token_count": self.remote_token_count,
+            "pending_token_count": len(self.pending_tokens),
+            "last_email": self.last_email,
+            "last_error": self.last_error,
+            "last_check_at": self.last_check_at,
+            "last_push_at": self.last_push_at,
+            "last_push_result": self.last_push_result,
+            "last_started_at": self.last_started_at,
+            "last_stopped_at": self.last_stopped_at,
+            "last_worker_started_at": self.last_worker_started_at,
+            "loop_errors": self.loop_errors,
+            "total_pushed_count": self.total_pushed_count,
+            "worker_seq": self.worker_seq,
+        }
 
 
 def read_settings() -> dict[str, Any]:
@@ -463,7 +367,7 @@ def read_settings() -> dict[str, Any]:
 
 def write_settings(settings: SystemSettings) -> dict[str, Any]:
     data = settings.model_dump()
-    execute(
+    execute_no_return(
         """
         INSERT INTO settings (key, value, updated_at)
         VALUES (?, ?, ?)
@@ -492,49 +396,113 @@ def merged_defaults() -> dict[str, Any]:
     if "api_append" in saved:
         api_base["append"] = bool(saved.get("api_append", True))
     base["api"] = api_base
+
+    controller = dict(base.get("controller") or {})
+    for key in ("concurrency", "auto_refill_enabled", "start_threshold", "stop_threshold", "push_batch_size", "poll_interval_sec"):
+        if key in saved:
+            controller[key] = saved[key]
+    controller["concurrency"] = max(1, min(int(controller.get("concurrency", 1)), MAX_CONCURRENT_TASKS))
+    controller["push_batch_size"] = max(1, int(controller.get("push_batch_size", 10)))
+    controller["poll_interval_sec"] = max(5, int(controller.get("poll_interval_sec", 30)))
+    controller["start_threshold"] = max(0, int(controller.get("start_threshold", 20)))
+    controller["stop_threshold"] = max(controller["start_threshold"] + 1, int(controller.get("stop_threshold", 50)))
+    controller["auto_refill_enabled"] = bool(controller.get("auto_refill_enabled", False))
+    base["controller"] = controller
     return base
 
 
-def build_task_config(payload: TaskCreate) -> dict[str, Any]:
+def build_worker_config(settings: dict[str, Any]) -> dict[str, Any]:
     defaults = merged_defaults()
     api_defaults = dict(defaults.get("api") or {})
     return {
-        "run": {"count": int(payload.count)},
-        "proxy": defaults.get("proxy", "") if payload.proxy is None else payload.proxy.strip(),
-        "browser_proxy": defaults.get("browser_proxy", "") if payload.browser_proxy is None else payload.browser_proxy.strip(),
-        "temp_mail_api_base": defaults.get("temp_mail_api_base", "") if payload.temp_mail_api_base is None else payload.temp_mail_api_base.strip(),
-        "temp_mail_admin_password": defaults.get("temp_mail_admin_password", "") if payload.temp_mail_admin_password is None else payload.temp_mail_admin_password.strip(),
-        "temp_mail_domain": defaults.get("temp_mail_domain", "") if payload.temp_mail_domain is None else payload.temp_mail_domain.strip(),
-        "temp_mail_site_password": defaults.get("temp_mail_site_password", "") if payload.temp_mail_site_password is None else payload.temp_mail_site_password.strip(),
+        "run": {"count": 1},
+        "proxy": str(settings.get("proxy", defaults.get("proxy", "")) or ""),
+        "browser_proxy": str(settings.get("browser_proxy", defaults.get("browser_proxy", "")) or ""),
+        "temp_mail_api_base": str(settings.get("temp_mail_api_base", defaults.get("temp_mail_api_base", "")) or ""),
+        "temp_mail_admin_password": str(settings.get("temp_mail_admin_password", defaults.get("temp_mail_admin_password", "")) or ""),
+        "temp_mail_domain": str(settings.get("temp_mail_domain", defaults.get("temp_mail_domain", "")) or ""),
+        "temp_mail_site_password": str(settings.get("temp_mail_site_password", defaults.get("temp_mail_site_password", "")) or ""),
         "api": {
-            "endpoint": api_defaults.get("endpoint", "") if payload.api_endpoint is None else payload.api_endpoint.strip(),
-            "token": api_defaults.get("token", "") if payload.api_token is None else payload.api_token.strip(),
-            "append": api_defaults.get("append", True) if payload.api_append is None else bool(payload.api_append),
+            "endpoint": str(settings.get("api_endpoint", api_defaults.get("endpoint", "")) or ""),
+            "token": str(settings.get("api_token", api_defaults.get("token", "")) or ""),
+            "append": bool(settings.get("api_append", api_defaults.get("append", True))),
         },
     }
 
 
-def serialize_task(row: sqlite3.Row) -> dict[str, Any]:
+def build_api_conf(settings: dict[str, Any]) -> dict[str, Any]:
+    defaults = merged_defaults()
+    api_defaults = dict(defaults.get("api") or {})
     return {
-        "id": int(row["id"]),
-        "name": row["name"],
-        "status": row["status"],
-        "target_count": int(row["target_count"]),
-        "completed_count": int(row["completed_count"]),
-        "failed_count": int(row["failed_count"]),
-        "current_round": int(row["current_round"]),
-        "current_phase": row["current_phase"] or "",
-        "last_email": row["last_email"] or "",
-        "last_error": row["last_error"] or "",
-        "last_log_at": row["last_log_at"] or "",
-        "notes": row["notes"] or "",
-        "config": json.loads(row["config_json"]),
-        "created_at": row["created_at"],
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-        "exit_code": row["exit_code"],
-        "pid": row["pid"],
+        "endpoint": str(settings.get("api_endpoint", api_defaults.get("endpoint", "")) or "").strip(),
+        "token": str(settings.get("api_token", api_defaults.get("token", "")) or "").strip(),
+        "append": bool(settings.get("api_append", api_defaults.get("append", True))),
     }
+
+
+def parse_tokens_payload(data: Any) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+    if isinstance(data.get("tokens"), dict):
+        items = data["tokens"].get("ssoBasic", [])
+    else:
+        items = data.get("ssoBasic", [])
+    tokens: list[str] = []
+    if not isinstance(items, list):
+        return tokens
+    for item in items:
+        token = item.get("token") if isinstance(item, dict) else str(item)
+        token = str(token or "").strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def fetch_remote_tokens(api_conf: dict[str, Any]) -> list[str]:
+    endpoint = api_conf.get("endpoint", "")
+    api_token = api_conf.get("token", "")
+    if not endpoint or not api_token:
+        raise RuntimeError("未配置 api.endpoint 或 api.token")
+    response = requests.get(endpoint, headers={"Authorization": f"Bearer {api_token}"}, timeout=20, verify=False)
+    if response.status_code != 200:
+        raise RuntimeError(f"查询远端 token 失败: HTTP {response.status_code} {response.text[:200]}")
+    return parse_tokens_payload(response.json())
+
+
+def fetch_remote_sso_count(api_conf: dict[str, Any]) -> int:
+    return len(fetch_remote_tokens(api_conf))
+
+
+def push_sso_batch(api_conf: dict[str, Any], new_tokens: list[str]) -> tuple[int, int]:
+    endpoint = api_conf.get("endpoint", "")
+    api_token = api_conf.get("token", "")
+    append_mode = bool(api_conf.get("append", True))
+    if not endpoint or not api_token:
+        raise RuntimeError("未配置 api.endpoint 或 api.token")
+    tokens_to_push = [str(token).strip() for token in new_tokens if str(token).strip()]
+    if not tokens_to_push:
+        return 0, 0
+    existing_count = 0
+    if append_mode:
+        existing = fetch_remote_tokens(api_conf)
+        existing_count = len(existing)
+        seen = set()
+        merged: list[str] = []
+        for token in existing + tokens_to_push:
+            if token not in seen:
+                seen.add(token)
+                merged.append(token)
+        tokens_to_push = merged
+    response = requests.post(
+        endpoint,
+        json={"ssoBasic": tokens_to_push},
+        headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+        timeout=60,
+        verify=False,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"推送 token 失败: HTTP {response.status_code} {response.text[:200]}")
+    return existing_count, len(tokens_to_push)
 
 
 def read_log_lines(path: Path, limit: int = 200) -> list[str]:
@@ -544,180 +512,257 @@ def read_log_lines(path: Path, limit: int = 200) -> list[str]:
     return lines[-limit:]
 
 
-def parse_console_state(console_path: Path) -> dict[str, Any]:
-    state = {
-        "completed_count": 0,
-        "failed_count": 0,
-        "current_round": 0,
-        "current_phase": "",
-        "last_email": "",
-        "last_error": "",
-        "last_log_at": now_iso(),
-    }
-    if not console_path.exists():
-        return state
-
-    lines = console_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    if not lines:
-        return state
-
-    interesting = (
-        "开始第",
-        "临时邮箱创建成功",
-        "已填写邮箱并点击注册",
-        "提取到验证码",
-        "已填写验证码",
-        "最终注册页",
-        "Turnstile",
-        "已填写注册资料并点击完成注册",
-        "注册成功",
-        "[Error]",
-        "已推送到 API",
-    )
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if m := LINE_RE_ROUND.search(line):
-            state["current_round"] = int(m.group(1))
-            state["current_phase"] = "starting_round"
-        if m := LINE_RE_SUCCESS.search(line):
-            state["completed_count"] += 1
-            state["last_email"] = m.group(1)
-            state["current_phase"] = "success"
-        if m := LINE_RE_ERROR.search(line):
-            state["failed_count"] += 1
-            state["last_error"] = m.group(2).strip()
-            state["current_phase"] = "error"
-        if m := LINE_RE_TEMP_EMAIL.search(line):
-            state["last_email"] = m.group(1)
-            state["current_phase"] = "mailbox_created"
-        if m := LINE_RE_FILLED_EMAIL.search(line):
-            state["last_email"] = m.group(1)
-            state["current_phase"] = "email_submitted"
-        if "提取到验证码" in line:
-            state["current_phase"] = "otp_received"
-        if "最终注册页" in line:
-            state["current_phase"] = "profile_page"
-        if "Turnstile 响应已同步" in line:
-            state["current_phase"] = "turnstile_solved"
-        if "已填写注册资料并点击完成注册" in line:
-            state["current_phase"] = "submitting_profile"
-        if LINE_RE_PUSH.search(line):
-            state["current_phase"] = "pushed_to_api"
-        if any(token in line for token in interesting):
-            state["last_log_at"] = now_iso()
-    return state
-
-
-def task_row(task_id: int) -> sqlite3.Row:
-    row = fetch_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    if row is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return row
-
-
-def delete_task_files(row: sqlite3.Row) -> None:
-    task_dir = Path(row["task_dir"])
-    if task_dir.exists() and task_dir.is_dir():
-        shutil.rmtree(task_dir, ignore_errors=True)
-
-
-def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None:
-    task_dir.mkdir(parents=True, exist_ok=True)
-    for file_name in PROJECT_FILES:
-        shutil.copy2(SOURCE_PROJECT / file_name, task_dir / file_name)
-    for dir_name in PROJECT_DIRS:
-        src = SOURCE_PROJECT / dir_name
-        dst = task_dir / dir_name
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-    (task_dir / "logs").mkdir(exist_ok=True)
-    (task_dir / "sso").mkdir(exist_ok=True)
-    (task_dir / "config.json").write_text(
-        json.dumps(task_config, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-class TaskSupervisor:
+class SingleControllerSupervisor:
     def __init__(self) -> None:
-        self._processes: dict[int, ManagedProcess] = {}
+        self._workers: dict[int, WorkerProcess] = {}
+        self._runtime = ControllerRuntime()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._stop = threading.Event()
+        self._lock = threading.RLock()
+        self._push_lock = threading.RLock()
+        self._last_poll = 0.0
+        self._controller_log = RUNTIME_DIR / "controller.log"
 
     def start(self) -> None:
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self.request_stop(flush_pending=False)
 
-    def stop_task(self, task_id: int) -> None:
-        managed = self._processes.get(task_id)
-        if not managed:
-            row = task_row(task_id)
-            if row["status"] == STATUS_QUEUED:
-                execute_no_return(
-                    """
-                    UPDATE tasks
-                    SET status = ?, finished_at = ?, last_error = ?
-                    WHERE id = ?
-                    """,
-                    (STATUS_STOPPED, now_iso(), "Task stopped before launch.", task_id),
-                )
-                return
-            raise HTTPException(status_code=409, detail="Task is not running")
-        execute_no_return(
-            "UPDATE tasks SET status = ?, last_error = ?, current_phase = ? WHERE id = ?",
-            (STATUS_STOPPING, "Stopping task...", STATUS_STOPPING, task_id),
-        )
-        try:
-            os.killpg(managed.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    def get_runtime(self) -> dict[str, Any]:
+        with self._lock:
+            self._runtime.current_running_workers = len(self._workers)
+            return self._runtime.to_dict()
 
-    def _running_count(self) -> int:
-        return len(self._processes)
+    def read_logs(self, limit: int = 300) -> list[str]:
+        return read_log_lines(self._controller_log, limit=limit)
+
+    def append_log(self, message: str) -> None:
+        line = f"{now_iso()} | {message}"
+        self._controller_log.parent.mkdir(parents=True, exist_ok=True)
+        with self._controller_log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def request_manual_start(self) -> None:
+        with self._lock:
+            self._runtime.desired_running = True
+            self._runtime.manual_mode = True
+            self._runtime.stop_requested = False
+            self._runtime.status = STATUS_MANUAL_RUNNING
+            self._runtime.current_phase = "manual_start_requested"
+            self._runtime.last_started_at = now_iso()
+        self.append_log("[controller] 已收到手动开始指令")
+
+    def request_stop(self, flush_pending: bool = True) -> None:
+        with self._lock:
+            self._runtime.desired_running = False
+            self._runtime.stop_requested = True
+            self._runtime.manual_mode = False
+            if self._workers:
+                self._runtime.status = STATUS_STOPPING
+                self._runtime.current_phase = "stopping_workers"
+            else:
+                self._runtime.status = STATUS_IDLE
+                self._runtime.current_phase = "idle"
+            self._runtime.last_stopped_at = now_iso()
+        self.append_log("[controller] 已收到停止指令")
+        for slot, worker in list(self._workers.items()):
+            try:
+                os.killpg(worker.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                self.append_log(f"[controller] 停止 worker-{slot} 失败: {exc}")
+        if flush_pending:
+            self._flush_pending(force=True)
+
+    def trigger_remote_check(self) -> dict[str, Any]:
+        self._check_remote(force=True)
+        return self.get_runtime()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self._refresh_running()
-                self._launch_queued()
-            except Exception:
-                pass
+                self._refresh_workers()
+                self._check_remote(force=False)
+                self._reconcile_mode()
+                self._launch_workers_if_needed()
+                self._flush_pending(force=False)
+            except Exception as exc:
+                with self._lock:
+                    self._runtime.loop_errors += 1
+                    self._runtime.status = STATUS_ERROR
+                    self._runtime.current_phase = "loop_error"
+                    self._runtime.last_error = str(exc)
+                self.append_log(f"[controller] 主循环异常: {exc}")
             time.sleep(SUPERVISOR_INTERVAL)
 
-    def _launch_queued(self) -> None:
-        slots = MAX_CONCURRENT_TASKS - self._running_count()
+    def _refresh_workers(self) -> None:
+        finished_slots: list[int] = []
+        for slot, worker in list(self._workers.items()):
+            exit_code = worker.process.poll()
+            if exit_code is None:
+                continue
+            result = self._read_worker_result(worker.result_path)
+            with self._lock:
+                self._runtime.current_running_workers = max(0, len(self._workers) - 1)
+                self._runtime.current_round += 1
+                self._runtime.last_email = result.get("email", self._runtime.last_email)
+                self._runtime.last_worker_started_at = worker.started_at
+                if exit_code == 0 and result.get("ok"):
+                    token = str(result.get("sso", "")).strip()
+                    if token:
+                        self._runtime.pending_tokens.append(token)
+                    self._runtime.completed_count += 1
+                    self._runtime.current_phase = "worker_succeeded"
+                    self.append_log(f"[worker-{slot}] 成功 email={result.get('email', '-')}")
+                else:
+                    self._runtime.failed_count += 1
+                    self._runtime.current_phase = "worker_failed"
+                    error = str(result.get("error", f"worker exited with {exit_code}"))
+                    self._runtime.last_error = error
+                    self.append_log(f"[worker-{slot}] 失败: {error}")
+            finished_slots.append(slot)
+            try:
+                worker.log_handle.close()
+            except Exception:
+                pass
+        for slot in finished_slots:
+            self._workers.pop(slot, None)
+        with self._lock:
+            self._runtime.current_running_workers = len(self._workers)
+            self._runtime.pending_token_count = len(self._runtime.pending_tokens)
+            if self._runtime.stop_requested and not self._workers:
+                self._runtime.status = STATUS_IDLE
+                self._runtime.current_phase = "idle"
+                self._runtime.stop_requested = False
+
+    def _read_worker_result(self, result_path: Path) -> dict[str, Any]:
+        if not result_path.exists():
+            return {"ok": False, "error": "worker result not found"}
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {"ok": False, "error": f"worker result invalid: {exc}"}
+        return data if isinstance(data, dict) else {"ok": False, "error": "worker result invalid"}
+
+    def _check_remote(self, force: bool) -> None:
+        settings = read_settings()
+        controller = merged_defaults().get("controller", {})
+        interval = int(controller.get("poll_interval_sec", 30))
+        now = time.time()
+        if not force and now - self._last_poll < interval:
+            return
+        self._last_poll = now
+        api_conf = build_api_conf(settings)
+        if not api_conf.get("endpoint") or not api_conf.get("token"):
+            with self._lock:
+                self._runtime.last_check_at = now_iso()
+                self._runtime.last_error = "未配置 api.endpoint 或 api.token，无法检测远端账号数量"
+            return
+        try:
+            remote_count = fetch_remote_sso_count(api_conf)
+            with self._lock:
+                self._runtime.remote_token_count = remote_count
+                self._runtime.last_check_at = now_iso()
+                if self._runtime.current_phase not in {"worker_succeeded", "worker_failed", "stopping_workers"}:
+                    self._runtime.current_phase = "remote_checked"
+            self.append_log(f"[controller] 远端账号数: {remote_count}")
+        except Exception as exc:
+            with self._lock:
+                self._runtime.last_check_at = now_iso()
+                self._runtime.last_error = str(exc)
+            self.append_log(f"[controller] 查询远端账号数失败: {exc}")
+
+    def _reconcile_mode(self) -> None:
+        settings = merged_defaults()
+        controller = dict(settings.get("controller") or {})
+        with self._lock:
+            if self._runtime.manual_mode:
+                self._runtime.status = STATUS_MANUAL_RUNNING if (self._runtime.desired_running or self._workers) else STATUS_IDLE
+                return
+            if not controller.get("auto_refill_enabled"):
+                if self._runtime.stop_requested and not self._workers:
+                    self._runtime.status = STATUS_IDLE
+                elif self._workers:
+                    self._runtime.status = STATUS_MANUAL_RUNNING
+                else:
+                    self._runtime.status = STATUS_IDLE
+                return
+            if self._runtime.remote_token_count < int(controller.get("start_threshold", 20)):
+                self._runtime.desired_running = True
+                self._runtime.status = STATUS_AUTO_RUNNING
+                self._runtime.current_phase = "auto_refill_running"
+            elif self._runtime.remote_token_count >= int(controller.get("stop_threshold", 50)):
+                self._runtime.desired_running = False
+                if self._workers:
+                    self._runtime.status = STATUS_STOPPING
+                    self._runtime.current_phase = "waiting_workers_stop"
+                else:
+                    self._runtime.status = STATUS_AUTO_IDLE
+                    self._runtime.current_phase = "auto_refill_idle"
+            elif self._workers:
+                self._runtime.status = STATUS_AUTO_RUNNING
+            else:
+                self._runtime.status = STATUS_AUTO_IDLE
+
+    def _launch_workers_if_needed(self) -> None:
+        settings = read_settings()
+        merged = merged_defaults()
+        controller = dict(merged.get("controller") or {})
+        if not self._runtime.desired_running:
+            return
+        if self._runtime.stop_requested:
+            return
+        slots = int(controller.get("concurrency", 1)) - len(self._workers)
         if slots <= 0:
             return
-        queued = fetch_all(
-            "SELECT * FROM tasks WHERE status = ? ORDER BY id ASC LIMIT ?",
-            (STATUS_QUEUED, slots),
-        )
-        for row in queued:
-            self._start_task(row)
+        if not SOURCE_PROJECT.exists():
+            raise RuntimeError(f"Source project not found: {SOURCE_PROJECT}")
+        if not SOURCE_VENV_PYTHON.exists():
+            raise RuntimeError(f"Python not found: {SOURCE_VENV_PYTHON}")
+        worker_config = build_worker_config(settings)
+        for _ in range(slots):
+            self._launch_single_worker(worker_config)
 
-    def _start_task(self, row: sqlite3.Row) -> None:
-        task_id = int(row["id"])
-        task_dir = Path(row["task_dir"])
-        console_path = Path(row["console_path"])
-        task_config = json.loads(row["config_json"])
-        copy_source_to_task_dir(task_dir, task_config)
-
-        output_path = task_dir / "sso" / f"task_{task_id}.txt"
+    def _launch_single_worker(self, worker_config: dict[str, Any]) -> None:
+        with self._lock:
+            self._runtime.worker_seq += 1
+            slot = self._runtime.worker_seq
+        task_dir = WORKERS_DIR / f"worker_{slot}"
+        if task_dir.exists():
+            shutil.rmtree(task_dir, ignore_errors=True)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        for file_name in PROJECT_FILES:
+            shutil.copy2(SOURCE_PROJECT / file_name, task_dir / file_name)
+        for dir_name in PROJECT_DIRS:
+            src = SOURCE_PROJECT / dir_name
+            dst = task_dir / dir_name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+        (task_dir / "logs").mkdir(exist_ok=True)
+        (task_dir / "sso").mkdir(exist_ok=True)
+        config_path = task_dir / "config.json"
+        config_path.write_text(json.dumps(worker_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        output_path = task_dir / "sso" / f"worker_{slot}.txt"
+        result_path = task_dir / "worker_result.json"
+        console_path = task_dir / "console.log"
+        log_handle = console_path.open("a", encoding="utf-8")
         command = [
             str(SOURCE_VENV_PYTHON),
             str(task_dir / "DrissionPage_example.py"),
             "--count",
-            str(int(row["target_count"])),
+            "1",
             "--output",
             str(output_path),
+            "--result-json",
+            str(result_path),
+            "--no-api-push",
+            "--worker-name",
+            f"worker-{slot}",
         ]
-        log_handle = console_path.open("a", encoding="utf-8")
         process = subprocess.Popen(
             command,
             cwd=task_dir,
@@ -726,80 +771,66 @@ class TaskSupervisor:
             start_new_session=True,
             text=True,
         )
-        self._processes[task_id] = ManagedProcess(task_id=task_id, process=process, log_handle=log_handle)
-        execute_no_return(
-            """
-            UPDATE tasks
-            SET status = ?, pid = ?, started_at = ?, current_phase = ?, last_log_at = ?
-            WHERE id = ?
-            """,
-            (STATUS_RUNNING, process.pid, now_iso(), "process_started", now_iso(), task_id),
+        self._workers[slot] = WorkerProcess(
+            slot=slot,
+            process=process,
+            task_dir=task_dir,
+            console_path=console_path,
+            result_path=result_path,
+            output_path=output_path,
+            started_at=now_iso(),
+            log_handle=log_handle,
         )
+        with self._lock:
+            self._runtime.current_running_workers = len(self._workers)
+            self._runtime.current_phase = "worker_started"
+            self._runtime.last_worker_started_at = now_iso()
+        self.append_log(f"[worker-{slot}] 已启动 pid={process.pid}")
 
-    def _refresh_running(self) -> None:
-        finished: list[int] = []
-        for task_id, managed in list(self._processes.items()):
-            row = task_row(task_id)
-            console_path = Path(row["console_path"])
-            parsed = parse_console_state(console_path)
-            execute_no_return(
-                """
-                UPDATE tasks
-                SET completed_count = ?, failed_count = ?, current_round = ?, current_phase = ?,
-                    last_email = ?, last_error = ?, last_log_at = ?
-                WHERE id = ?
-                """,
-                (
-                    parsed["completed_count"],
-                    parsed["failed_count"],
-                    parsed["current_round"],
-                    parsed["current_phase"],
-                    parsed["last_email"],
-                    parsed["last_error"],
-                    parsed["last_log_at"],
-                    task_id,
-                ),
-            )
-            exit_code = managed.process.poll()
-            if exit_code is None:
-                continue
-            final_status = STATUS_FAILED
-            if row["status"] == STATUS_STOPPING or exit_code in (-15, -9):
-                final_status = STATUS_STOPPED
-            elif parsed["completed_count"] >= int(row["target_count"]) and exit_code == 0:
-                final_status = STATUS_COMPLETED
-            elif parsed["completed_count"] > 0:
-                final_status = STATUS_PARTIAL
-            execute_no_return(
-                """
-                UPDATE tasks
-                SET status = ?, finished_at = ?, exit_code = ?,
-                    completed_count = ?, failed_count = ?, current_round = ?, current_phase = ?,
-                    last_email = ?, last_error = ?, last_log_at = ?
-                WHERE id = ?
-                """,
-                (
-                    final_status,
-                    now_iso(),
-                    exit_code,
-                    parsed["completed_count"],
-                    parsed["failed_count"],
-                    parsed["current_round"],
-                    parsed["current_phase"] or final_status,
-                    parsed["last_email"],
-                    parsed["last_error"],
-                    parsed["last_log_at"],
-                    task_id,
-                ),
-            )
-            finished.append(task_id)
-        for task_id in finished:
-            managed = self._processes.pop(task_id, None)
-            if managed and managed.log_handle:
-                managed.log_handle.close()
+    def _flush_pending(self, force: bool) -> None:
+        settings = read_settings()
+        merged = merged_defaults()
+        controller = dict(merged.get("controller") or {})
+        batch_size = int(controller.get("push_batch_size", 10))
+        with self._lock:
+            pending = list(self._runtime.pending_tokens)
+        if not pending:
+            return
+        if not force and len(pending) < batch_size:
+            return
+        api_conf = build_api_conf(settings)
+        if not api_conf.get("endpoint") or not api_conf.get("token"):
+            return
+        with self._push_lock:
+            with self._lock:
+                tokens = list(self._runtime.pending_tokens)
+            if not tokens:
+                return
+            if not force and len(tokens) < batch_size:
+                return
+            if not force:
+                tokens = tokens[:batch_size]
+            try:
+                existing_count, final_count = push_sso_batch(api_conf, tokens)
+            except Exception as exc:
+                with self._lock:
+                    self._runtime.last_push_at = now_iso()
+                    self._runtime.last_push_result = f"失败: {exc}"
+                    self._runtime.last_error = str(exc)
+                self.append_log(f"[controller] 批量推送失败: {exc}")
+                return
+            with self._lock:
+                remaining = self._runtime.pending_tokens[len(tokens):]
+                self._runtime.pending_tokens = remaining
+                self._runtime.pending_token_count = len(remaining)
+                self._runtime.last_push_at = now_iso()
+                self._runtime.last_push_result = f"成功推送 {len(tokens)} 个，本次合并后远端共 {final_count} 个"
+                self._runtime.remote_token_count = final_count if api_conf.get("append", True) else len(tokens)
+                self._runtime.total_pushed_count += len(tokens)
+            self.append_log(f"[controller] 批量推送成功: 新推 {len(tokens)} 个，原有 {existing_count} 个，推送后 {final_count} 个")
 
 
-supervisor = TaskSupervisor()
+supervisor = SingleControllerSupervisor()
 
 
 @asynccontextmanager
@@ -853,78 +884,42 @@ def get_settings() -> dict[str, Any]:
 
 @app.post("/api/settings")
 def save_settings(payload: SystemSettings) -> dict[str, Any]:
+    if payload.concurrency > MAX_CONCURRENT_TASKS:
+        raise HTTPException(status_code=400, detail=f"并发数不能超过控制台上限 {MAX_CONCURRENT_TASKS}")
     saved = write_settings(payload)
     return {"settings": saved, "defaults": merged_defaults()}
 
 
-@app.get("/api/tasks")
-def list_tasks() -> dict[str, Any]:
-    rows = fetch_all("SELECT * FROM tasks ORDER BY id DESC")
-    return {"tasks": [serialize_task(row) for row in rows]}
+@app.get("/api/controller")
+def get_controller() -> dict[str, Any]:
+    return {
+        "settings": read_settings(),
+        "defaults": merged_defaults(),
+        "runtime": supervisor.get_runtime(),
+    }
 
 
-@app.post("/api/tasks")
-def create_task(payload: TaskCreate) -> dict[str, Any]:
-    if not SOURCE_PROJECT.exists():
-        raise HTTPException(status_code=500, detail=f"Source project not found: {SOURCE_PROJECT}")
-    if not SOURCE_VENV_PYTHON.exists():
-        raise HTTPException(status_code=500, detail=f"Python not found: {SOURCE_VENV_PYTHON}")
-    task_config = build_task_config(payload)
-    created_at = now_iso()
-    task_id = execute(
-        """
-        INSERT INTO tasks (
-            name, status, target_count, notes, config_json, task_dir, console_path, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.name.strip(),
-            STATUS_QUEUED,
-            payload.count,
-            payload.notes.strip(),
-            json.dumps(task_config, ensure_ascii=False),
-            str(TASKS_DIR / "pending"),
-            str(TASKS_DIR / "pending.log"),
-            created_at,
-        ),
-    )
-    task_dir = TASKS_DIR / f"task_{task_id}"
-    console_path = task_dir / "console.log"
-    task_dir.mkdir(parents=True, exist_ok=True)
-    execute_no_return(
-        "UPDATE tasks SET task_dir = ?, console_path = ? WHERE id = ?",
-        (str(task_dir), str(console_path), task_id),
-    )
-    return {"task": serialize_task(task_row(task_id))}
+@app.get("/api/controller/logs")
+def get_controller_logs(limit: int = Query(300, ge=20, le=2000)) -> dict[str, Any]:
+    return {"lines": supervisor.read_logs(limit=limit)}
 
 
-@app.get("/api/tasks/{task_id}")
-def get_task(task_id: int) -> dict[str, Any]:
-    return {"task": serialize_task(task_row(task_id))}
+@app.post("/api/controller/start")
+def start_controller() -> dict[str, Any]:
+    supervisor.request_manual_start()
+    return {"ok": True, "runtime": supervisor.get_runtime()}
 
 
-@app.get("/api/tasks/{task_id}/logs")
-def get_task_logs(task_id: int, limit: int = Query(200, ge=20, le=1000)) -> dict[str, Any]:
-    row = task_row(task_id)
-    console_path = Path(row["console_path"])
-    return {"lines": read_log_lines(console_path, limit=limit)}
+@app.post("/api/controller/stop")
+def stop_controller() -> dict[str, Any]:
+    supervisor.request_stop(flush_pending=True)
+    return {"ok": True, "runtime": supervisor.get_runtime()}
 
 
-@app.post("/api/tasks/{task_id}/stop")
-def stop_task(task_id: int) -> dict[str, Any]:
-    supervisor.stop_task(task_id)
-    return {"ok": True}
-
-
-@app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: int) -> dict[str, Any]:
-    row = task_row(task_id)
-    managed = supervisor._processes.get(task_id)
-    if managed and managed.process.poll() is None:
-        raise HTTPException(status_code=409, detail="Task is still running")
-    delete_task_files(row)
-    execute_no_return("DELETE FROM tasks WHERE id = ?", (task_id,))
-    return {"ok": True}
+@app.post("/api/controller/check")
+def check_controller() -> dict[str, Any]:
+    runtime = supervisor.trigger_remote_check()
+    return {"ok": True, "runtime": runtime}
 
 
 if __name__ == "__main__":

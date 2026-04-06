@@ -4,11 +4,11 @@
 
 ## run.count
 
-本次任务最多尝试多少轮注册。
+命令行模式下，本次脚本最多尝试多少轮注册。
 
 - `50`：跑 50 轮后自动退出
 - `1`：做一次验证
-- 不建议在控制台里直接配无限循环
+- 控制台单控制器模式内部会强制按单轮 worker 启动，所以这里主要影响命令行直跑
 
 ## browser_proxy
 
@@ -86,11 +86,11 @@
 
 典型示例：
 
-- `http://127.0.0.1:8000/v1/admin/tokens`（宿主机或本机）
-- `http://host.docker.internal:8000/v1/admin/tokens`（控制台跑在 Docker 内、grok2api 在宿主机时，与根目录 compose 默认一致）
-- 若 grok2api 与其它服务在同一 Docker 网络中，也可使用对应服务名，例如 `http://grok2api:8000/v1/admin/tokens`
+- `http://127.0.0.1:8000/v1/admin/tokens`
+- `http://host.docker.internal:8000/v1/admin/tokens`
+- `http://grok2api:8000/v1/admin/tokens`
 
-如果留空，任务仍然能注册，但不会自动入池。
+如果留空，命令行任务仍然能注册，但控制台的自动补号与批量推送都无法工作。
 
 ## api.token
 
@@ -103,15 +103,54 @@
 - `true`：先读取线上已有 token，再把本次结果合并去重后回写。适合生产环境。
 - `false`：不读存量，直接用本次结果覆盖远端。只建议在测试环境里使用。
 
-## 系统默认配置 vs 任务覆盖
+## controller.concurrency
 
-两者不冲突，规则很简单：
+单控制器模式下，内部同时运行多少个注册 worker。
 
-1. 系统默认配置是全局底板
-2. 新建任务时如果不展开高级设置，就直接继承系统默认值
-3. 任务里填写了某个覆盖字段，只有那个任务会改，不会回写系统默认配置
+- `1`：串行跑
+- `2` 或更多：并发跑多个独立 worker
+- 实际上限受控制台环境变量 `GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS` 限制
 
-所以更推荐的使用方式是：
+## controller.auto_refill_enabled
 
-- 把稳定不变的东西填在系统默认配置
-- 只把这一次临时要变的参数填在任务高级设置
+是否开启自动补号。
+
+- `false`：只支持手动点击开始/停止
+- `true`：控制台会按检测周期自动查询 grok2api 当前账号数，并按阈值自动启停
+
+## controller.start_threshold
+
+自动补号的启动阈值。
+
+- 当远端账号数 `< start_threshold` 时，控制台自动开始补号
+- 必须小于 `controller.stop_threshold`
+
+## controller.stop_threshold
+
+自动补号的停止阈值。
+
+- 当远端账号数 `>= stop_threshold` 时，控制台停止继续拉起新 worker
+- 已经在跑的 worker 会自然收尾，然后整体进入待机
+
+## controller.push_batch_size
+
+分批发送数量。
+
+- 每成功多少个账号就向 `api.endpoint` 推送一次
+- 停止控制器时，如果还有不足一批的 token，也会补发一次
+
+## controller.poll_interval_sec
+
+自动补号模式下，轮询 grok2api 当前账号数量的时间间隔，单位秒。
+
+- 间隔越小，自动补号响应越快
+- 间隔越小，对 grok2api 的查询压力也越大
+
+## 系统默认配置 vs 单控制器运行
+
+现在控制台不再以“创建很多任务”为主，而是只有一个全局控制器：
+
+1. 系统默认配置就是控制器运行配置
+2. 点击开始后，控制器按并发数拉起多个 worker
+3. 若开启自动补号，控制器会按阈值自动开始和停止
+4. 注册成功的 token 会按批次入池，不再等整批结束再统一发送
