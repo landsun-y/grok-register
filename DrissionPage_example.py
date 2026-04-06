@@ -399,7 +399,8 @@ return true;
 
 def fill_code_and_submit(email, dev_token, timeout=60):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
-    code = get_oai_code(dev_token, email)
+    # 邮件到达常慢于页面跳转；轮询时长需 ≥ UI 等待，且不宜过短（原先 get_oai_code 默认仅 30s）
+    code = get_oai_code(dev_token, email, timeout=max(120, timeout))
     if not code:
         raise Exception("获取验证码失败")
 

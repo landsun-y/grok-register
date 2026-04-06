@@ -14,8 +14,8 @@
 
 其中：
 
-- `warp` 和 `grok2api` 已经内置在本仓库的 `docker compose` 里
-- 你第一次部署时主要还需要自己准备临时邮箱 API
+- `warp` 已内置在本仓库的 `docker compose` 里；`grok2api` 需自行部署，并在 `.env` 中配置 `GROK_REGISTER_DEFAULT_API_ENDPOINT` 等
+- 你第一次部署时主要还需要自己准备临时邮箱 API 与可用的 grok2api sink
 - 临时邮箱接口长什么样，直接看 [temp-mail-api.md](temp-mail-api.md)
 
 宿主机模式下，至少准备好：
@@ -56,21 +56,21 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-默认端口：
+默认暴露端口（控制台）：
 
 - `18600`
-- `8000`
 
 启动后打开：
 
 - `http://<你的服务器IP>:18600`
-- `http://<你的服务器IP>:8000/admin`
+
+grok2api 若跑在宿主机，管理后台端口由你自行决定（`.env` 里 `GROK_REGISTER_DEFAULT_API_ENDPOINT` 需与之对应）。
 
 说明：
 
-- 这个 Compose 会把控制台、浏览器和 Python 运行环境一起起起来
-- 它也会把 `warp` 和 `grok2api` 一起起起来
-- 所以首次部署时，你主要需要在控制台里补全临时邮箱相关参数
+- 这个 Compose 会把控制台、浏览器和 Python 运行环境以及 `warp` 一起起起来
+- `grok2api` 不在此 Compose 内，需单独部署
+- 首次部署时，你主要需要在控制台里补全临时邮箱相关参数，并确认 sink 地址可用
 
 ## 4. 准备运行配置
 
@@ -101,7 +101,7 @@ cp config.example.json config.json
 - `api.endpoint`
 - `api.token`
 
-通常不需要手工再改，因为控制台会默认指向内置的 `warp` 和 `grok2api`。
+`browser_proxy` / `proxy` 通常默认指向 `warp`；`api.endpoint` / `api.token` 需与你的 grok2api 部署一致（默认示例为 `host.docker.internal:8000`）。
 
 ## 5. 先做一次命令行验证
 

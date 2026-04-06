@@ -45,5 +45,5 @@
 
 在当前仓库里：
 
-- `warp` 和 `grok2api` 已经可以跟随 `docker compose` 一起启动
+- `warp` 可跟随根目录 `docker compose` 一起启动；`grok2api` 需单独部署并与控制台配置对齐
 - 临时邮箱仍然需要你自己提供，因为不同用户的可用域名和实现方式差异很大

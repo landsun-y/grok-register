@@ -18,6 +18,8 @@
 - 死信重试
 - 多个 sink 目标并发推送
 
-在当前一体化部署里，根目录 [docker-compose.yml](../../docker-compose.yml) 已经内置 `grok2api` 服务。控制台默认会把 `api.endpoint` 指向：
+根目录 [docker-compose.yml](../../docker-compose.yml) 不包含 `grok2api`，需自行部署。控制台默认可把 `api.endpoint` 指向宿主机上的服务，例如：
 
-- `http://grok2api:8000/v1/admin/tokens`
+- `http://host.docker.internal:8000/v1/admin/tokens`
+
+若 grok2api 在独立 compose 栈且与控制台共用网络，再改为对应服务 URL。

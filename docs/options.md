@@ -86,8 +86,9 @@
 
 典型示例：
 
-- `http://127.0.0.1:8000/v1/admin/tokens`
-- `http://grok2api:8000/v1/admin/tokens`
+- `http://127.0.0.1:8000/v1/admin/tokens`（宿主机或本机）
+- `http://host.docker.internal:8000/v1/admin/tokens`（控制台跑在 Docker 内、grok2api 在宿主机时，与根目录 compose 默认一致）
+- 若 grok2api 与其它服务在同一 Docker 网络中，也可使用对应服务名，例如 `http://grok2api:8000/v1/admin/tokens`
 
 如果留空，任务仍然能注册，但不会自动入池。
 

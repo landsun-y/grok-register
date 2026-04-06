@@ -56,7 +56,7 @@
 - 与 `grok2api` 这类消费端对接
 - 做去重、落池和结果校验
 
-当前一体化部署里，它由根目录 [docker-compose.yml](../docker-compose.yml) 中的 `grok2api` 服务提供。
+根目录 [docker-compose.yml](../docker-compose.yml) 不再包含 `grok2api` 服务；请自行部署 grok2api，并通过环境变量或控制台配置 sink 地址。
 
 ### 5. worker-runtime
 
@@ -82,5 +82,5 @@
 2. `console` 创建任务并写入任务级 `config.json`
 3. `register-runner` 独立执行注册流程
 4. 成功后将 `sso` 追加写入本地文件
-5. 同时把 `sso` 推送到内置 `grok2api`
+5. 同时把 `sso` 推送到你配置的 `grok2api` 兼容接口
 6. `console` 持续从日志解析实时状态并展示

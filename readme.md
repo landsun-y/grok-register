@@ -18,12 +18,11 @@
 - 可被 `x.ai` 接受的临时邮箱域名
 - 可接收 token 的下游 sink，例如 `grok2api`
 
-现在仓库已经内置：
+现在仓库在 Docker 里默认内置：
 
 - `warp`：默认网络出口
-- `grok2api`：默认 token sink
 
-所以新部署时，你不需要再额外去拉其它仓库拼接。你还需要自己准备的，主要是临时邮箱 API 和对应域名。
+`grok2api` **不再**随本仓库 `docker compose` 一起构建；请自行部署（例如你的二次开发版本），并在 `.env` 里配置 `GROK_REGISTER_DEFAULT_API_ENDPOINT` 与 `GROK_REGISTER_DEFAULT_API_TOKEN`（默认尝试通过 `host.docker.internal` 访问宿主机上的 grok2api）。你还需要自己准备的，主要是临时邮箱 API 和对应域名。
 
 ## 最快启动方式
 
@@ -36,12 +35,13 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-如果需要改外网端口或 `grok2api` 后台口令，先编辑 `.env`。
+启动前请在 `.env` 中确认控制台端口，以及 **自行部署的 grok2api** 的地址与后台口令（与 `GROK_REGISTER_DEFAULT_API_*` 一致）。
 
-启动后访问：
+启动后访问控制台：
 
 - `http://<你的服务器IP>:18600`
-- `http://<你的服务器IP>:8000/admin`
+
+grok2api 管理后台地址取决于你如何部署（例如宿主机 `8000` 端口或其它主机）。
 
 然后在控制台里填写：
 
@@ -58,9 +58,9 @@ docker compose up -d --build
 默认情况下：
 
 - `browser_proxy` 和 `proxy` 已经预设为容器内的 `warp`
-- `api.endpoint` 和 `api.token` 已经预设为容器内的 `grok2api`
+- `api.endpoint` 默认指向 `http://host.docker.internal:8000/v1/admin/tokens`（需宿主机上已有 grok2api 监听该端口，或改成你的实际 URL）
 
-所以第一次部署时，你通常只需要补全临时邮箱这一组参数。
+所以第一次部署时，你通常要同时补全：**临时邮箱参数** 与 **可用的 grok2api 地址和 token**。
 
 ## 宿主机启动方式
 
@@ -82,11 +82,11 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb chromium-browser
 - `apt install xvfb`
 - `apt install chromium-browser` 或自行安装 `google-chrome-stable`
 
-如果你只想先把内置网络和 sink 起起来，也可以执行：
+如果你只想先把内置网络起起来，也可以执行：
 
 ```bash
 cp .env.example .env
-docker compose up -d warp grok2api
+docker compose up -d warp
 ```
 
 ## 命令行验证
