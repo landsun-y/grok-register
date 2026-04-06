@@ -1,6 +1,5 @@
 services:
-  # 内置 grok2api / flaresolverr 已移除：请自行部署二次开发的 grok2api，并在 .env 中配置
-  # GROK_REGISTER_DEFAULT_API_ENDPOINT（例如宿主机 http://host.docker.internal:8000/... 或局域网 IP）。
+  # 内置 grok2api 已移除：请自行部署，并在 .env 中配置 API endpoint/token。
 
   warp:
     image: caomingjun/warp:latest
@@ -11,6 +10,14 @@ services:
       - NET_ADMIN
     ports:
       - "127.0.0.1:1080:1080"
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
 
   console:
     build:
@@ -39,3 +46,4 @@ services:
     restart: unless-stopped
     depends_on:
       - warp
+      - flaresolverr

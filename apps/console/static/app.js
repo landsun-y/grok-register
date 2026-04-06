@@ -130,8 +130,7 @@
 
   async function refreshLogs() {
     const data = await fetchJson("/api/controller/logs?limit=400");
-    consoleOutputEl.innerHTML = escapeHtml((data.lines || []).join("
-"));
+    consoleOutputEl.innerHTML = escapeHtml((data.lines || []).join("\n"));
     consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
   }
 
