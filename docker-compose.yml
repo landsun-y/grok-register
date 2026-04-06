@@ -11,14 +11,6 @@ services:
     ports:
       - "127.0.0.1:1080:1080"
 
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    restart: unless-stopped
-    environment:
-      LOG_LEVEL: info
-      LOG_HTML: "false"
-      CAPTCHA_SOLVER: none
-
   console:
     build:
       context: .
@@ -46,4 +38,3 @@ services:
     restart: unless-stopped
     depends_on:
       - warp
-      - flaresolverr
