@@ -304,6 +304,7 @@ class WorkerProcess:
     output_path: Path
     started_at: str
     log_handle: Any
+    collected_lines: int = 0
 
 
 @dataclass
@@ -594,6 +595,11 @@ class SingleControllerSupervisor:
             self._runtime.last_stopped_at = now_iso()
         if was_enabled:
             self.append_log("[controller] 总开关已关闭")
+        self._kill_all_workers()
+        if flush_pending:
+            self._flush_pending(force=True)
+
+    def _kill_all_workers(self) -> None:
         for slot, worker in list(self._workers.items()):
             try:
                 os.killpg(worker.process.pid, signal.SIGTERM)
@@ -601,8 +607,6 @@ class SingleControllerSupervisor:
                 pass
             except Exception as exc:
                 self.append_log(f"[controller] 停止 worker-{slot} 失败: {exc}")
-        if flush_pending:
-            self._flush_pending(force=True)
 
     def trigger_remote_check(self) -> dict[str, Any]:
         self._check_remote(force=True)
@@ -625,31 +629,45 @@ class SingleControllerSupervisor:
                 self.append_log(f"[controller] 主循环异常: {exc}")
             time.sleep(SUPERVISOR_INTERVAL)
 
+    def _collect_new_tokens(self, worker: "WorkerProcess") -> list[str]:
+        if not worker.output_path.exists():
+            return []
+        try:
+            lines = worker.output_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        new_lines = lines[worker.collected_lines:]
+        worker.collected_lines = len(lines)
+        return [line.strip() for line in new_lines if line.strip()]
+
     def _refresh_workers(self) -> None:
+        for slot, worker in list(self._workers.items()):
+            new_tokens = self._collect_new_tokens(worker)
+            if new_tokens:
+                with self._lock:
+                    for token in new_tokens:
+                        self._runtime.pending_tokens.append(token)
+                        self._runtime.completed_count += 1
+                        self._runtime.current_round += 1
+                    self._runtime.current_phase = "worker_succeeded"
+                self.append_log(f"[worker-{slot}] 成功 +{len(new_tokens)} token")
+
         finished_slots: list[int] = []
         for slot, worker in list(self._workers.items()):
             exit_code = worker.process.poll()
             if exit_code is None:
                 continue
-            result = self._read_worker_result(worker.result_path)
-            with self._lock:
-                self._runtime.current_running_workers = max(0, len(self._workers) - 1)
-                self._runtime.current_round += 1
-                self._runtime.last_email = result.get("email", self._runtime.last_email)
-                self._runtime.last_worker_started_at = worker.started_at
-                if exit_code == 0 and result.get("ok"):
-                    token = str(result.get("sso", "")).strip()
-                    if token:
-                        self._runtime.pending_tokens.append(token)
-                    self._runtime.completed_count += 1
-                    self._runtime.current_phase = "worker_succeeded"
-                    self.append_log(f"[worker-{slot}] 成功 email={result.get('email', '-')}")
-                else:
+            self._collect_new_tokens(worker)
+            if exit_code != 0:
+                result = self._read_worker_result(worker.result_path)
+                error = str(result.get("error", f"worker exited with {exit_code}"))
+                with self._lock:
                     self._runtime.failed_count += 1
-                    self._runtime.current_phase = "worker_failed"
-                    error = str(result.get("error", f"worker exited with {exit_code}"))
                     self._runtime.last_error = error
-                    self.append_log(f"[worker-{slot}] 失败: {error}")
+                    self._runtime.current_phase = "worker_failed"
+                self.append_log(f"[worker-{slot}] 异常退出: {error}")
+            else:
+                self.append_log(f"[worker-{slot}] 已退出")
             finished_slots.append(slot)
             try:
                 worker.log_handle.close()
@@ -657,6 +675,7 @@ class SingleControllerSupervisor:
                 pass
         for slot in finished_slots:
             self._workers.pop(slot, None)
+
         should_flush_pending = False
         with self._lock:
             self._runtime.current_running_workers = len(self._workers)
@@ -729,6 +748,7 @@ class SingleControllerSupervisor:
                 batch_limit = int(controller.get("single_batch_count", 10))
                 if self._runtime.completed_count >= batch_limit:
                     self._runtime.desired_running = False
+                    need_kill = bool(self._workers)
                     if self._workers:
                         self._runtime.status = STATUS_STOPPING
                         self._runtime.current_phase = "stopping_workers"
@@ -736,6 +756,10 @@ class SingleControllerSupervisor:
                         self._runtime.status = STATUS_IDLE
                         self._runtime.current_phase = "idle"
                         self._runtime.controller_enabled = False
+                    if need_kill:
+                        self._kill_all_workers()
+                        self.append_log(f"[controller] 单次补号完成 ({self._runtime.completed_count}/{batch_limit})，正在停止 worker")
+                    elif not self._runtime.controller_enabled:
                         self.append_log(f"[controller] 单次补号完成 ({self._runtime.completed_count}/{batch_limit})")
                 else:
                     self._runtime.desired_running = True
@@ -748,12 +772,15 @@ class SingleControllerSupervisor:
                 self._runtime.current_phase = "auto_refill_running"
             elif self._runtime.remote_token_count >= int(controller.get("stop_threshold", 50)):
                 self._runtime.desired_running = False
+                need_kill = bool(self._workers)
                 if self._workers:
                     self._runtime.status = STATUS_STOPPING
                     self._runtime.current_phase = "waiting_workers_stop"
                 else:
                     self._runtime.status = STATUS_AUTO_IDLE
                     self._runtime.current_phase = "auto_refill_idle"
+                if need_kill:
+                    self._kill_all_workers()
             elif self._workers:
                 self._runtime.status = STATUS_AUTO_RUNNING
                 self._runtime.current_phase = "auto_refill_running"
@@ -762,14 +789,15 @@ class SingleControllerSupervisor:
                 self._runtime.current_phase = "auto_refill_waiting"
 
     def _launch_workers_if_needed(self) -> None:
-        settings = read_settings()
-        merged = merged_defaults()
-        controller = dict(merged.get("controller") or {})
         if not self._runtime.desired_running:
             return
         if self._runtime.stop_requested:
             return
-        slots = int(controller.get("concurrency", 1)) - len(self._workers)
+        settings = read_settings()
+        merged = merged_defaults()
+        controller = dict(merged.get("controller") or {})
+        concurrency = int(controller.get("concurrency", 1))
+        slots = concurrency - len(self._workers)
         if slots <= 0:
             return
         if not SOURCE_PROJECT.exists():
@@ -780,35 +808,42 @@ class SingleControllerSupervisor:
         for _ in range(slots):
             self._launch_single_worker(worker_config)
 
+    def _prepare_worker_dir(self, slot: int) -> Path:
+        task_dir = WORKERS_DIR / f"worker_{slot}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        for file_name in PROJECT_FILES:
+            src = SOURCE_PROJECT / file_name
+            dst = task_dir / file_name
+            if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                shutil.copy2(src, dst)
+        for dir_name in PROJECT_DIRS:
+            src = SOURCE_PROJECT / dir_name
+            dst = task_dir / dir_name
+            if not dst.exists():
+                shutil.copytree(src, dst)
+        (task_dir / "logs").mkdir(exist_ok=True)
+        (task_dir / "sso").mkdir(exist_ok=True)
+        return task_dir
+
     def _launch_single_worker(self, worker_config: dict[str, Any]) -> None:
         with self._lock:
             self._runtime.worker_seq += 1
             slot = self._runtime.worker_seq
-        task_dir = WORKERS_DIR / f"worker_{slot}"
-        if task_dir.exists():
-            shutil.rmtree(task_dir, ignore_errors=True)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        for file_name in PROJECT_FILES:
-            shutil.copy2(SOURCE_PROJECT / file_name, task_dir / file_name)
-        for dir_name in PROJECT_DIRS:
-            src = SOURCE_PROJECT / dir_name
-            dst = task_dir / dir_name
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-        (task_dir / "logs").mkdir(exist_ok=True)
-        (task_dir / "sso").mkdir(exist_ok=True)
+        task_dir = self._prepare_worker_dir(slot)
         config_path = task_dir / "config.json"
         config_path.write_text(json.dumps(worker_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         output_path = task_dir / "sso" / f"worker_{slot}.txt"
         result_path = task_dir / "worker_result.json"
+        for p in (output_path, result_path):
+            if p.exists():
+                p.unlink()
         console_path = task_dir / "console.log"
         log_handle = console_path.open("a", encoding="utf-8")
         command = [
             str(SOURCE_VENV_PYTHON),
             str(task_dir / "DrissionPage_example.py"),
             "--count",
-            "1",
+            "0",
             "--output",
             str(output_path),
             "--result-json",

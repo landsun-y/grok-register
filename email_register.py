@@ -196,7 +196,8 @@ def create_temp_email() -> Tuple[str, str, str]:
     api_base = _normalize_api_base(TEMP_MAIL_API_BASE)
     session, use_cffi = _create_session()
     headers = _build_vmail_headers()
-    payload: Dict[str, Any] = {"expiresIn": 86400}
+    local_part = _generate_local_part()
+    payload: Dict[str, Any] = {"localPart": local_part, "expiresIn": 86400}
     domain = _choose_vmail_domain()
     if domain:
         payload["domain"] = domain
