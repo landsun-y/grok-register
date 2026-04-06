@@ -34,7 +34,6 @@ SOURCE_PROJECT = Path(os.getenv("GROK_REGISTER_SOURCE_DIR", str(REPO_ROOT))).res
 SOURCE_VENV_PYTHON = Path(
     os.getenv("GROK_REGISTER_PYTHON", str(SOURCE_PROJECT / ".venv" / "bin" / "python"))
 ).expanduser()
-MAX_CONCURRENT_TASKS = max(1, int(os.getenv("GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS", "1")))
 SUPERVISOR_INTERVAL = max(1.0, float(os.getenv("GROK_REGISTER_CONSOLE_POLL_INTERVAL", "2")))
 
 PROJECT_FILES = ("DrissionPage_example.py", "email_register.py")
@@ -282,7 +281,7 @@ class SystemSettings(BaseModel):
 
 
 class ControllerSettingsPayload(BaseModel):
-    concurrency: int = Field(1, ge=1, le=32)
+    concurrency: int = Field(1, ge=1)
     auto_refill_enabled: bool = False
     single_batch_count: int = Field(10, ge=1, le=100000)
     start_threshold: int = Field(20, ge=0, le=1000000)
@@ -422,7 +421,7 @@ def merged_defaults() -> dict[str, Any]:
     for key in ("concurrency", "auto_refill_enabled", "single_batch_count", "start_threshold", "stop_threshold", "push_batch_size", "poll_interval_sec"):
         if key in saved:
             controller[key] = saved[key]
-    controller["concurrency"] = max(1, min(int(controller.get("concurrency", 1)), MAX_CONCURRENT_TASKS))
+    controller["concurrency"] = max(1, int(controller.get("concurrency", 1)))
     controller["single_batch_count"] = max(1, int(controller.get("single_batch_count", 10)))
     controller["push_batch_size"] = max(1, int(controller.get("push_batch_size", 10)))
     controller["poll_interval_sec"] = max(5, int(controller.get("poll_interval_sec", 30)))
@@ -906,7 +905,6 @@ def _page_context(request: Request, active_page: str) -> dict[str, Any]:
     return {
         "request": request,
         "defaults": json.dumps(merged_defaults(), ensure_ascii=False),
-        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
         "source_project": str(SOURCE_PROJECT),
         "active_page": active_page,
     }
@@ -929,7 +927,6 @@ def api_meta() -> dict[str, Any]:
         "settings": read_settings(),
         "source_project": str(SOURCE_PROJECT),
         "python_path": str(SOURCE_VENV_PYTHON),
-        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
     }
 
 
@@ -951,8 +948,6 @@ def save_settings(payload: SystemSettings) -> dict[str, Any]:
 
 @app.post("/api/controller/settings")
 def save_controller_settings(payload: ControllerSettingsPayload) -> dict[str, Any]:
-    if payload.concurrency > MAX_CONCURRENT_TASKS:
-        raise HTTPException(status_code=400, detail=f"并发数不能超过控制台上限 {MAX_CONCURRENT_TASKS}")
     saved = write_controller_settings(payload)
     return {"settings": saved, "defaults": merged_defaults(), "runtime": supervisor.get_runtime()}
 
