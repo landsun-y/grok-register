@@ -9,37 +9,29 @@
 <body data-page="controller">
   <div id="app" class="shell">
     <header class="topbar">
-      <div class="brand">
-        <div class="brand-kicker">Unified Console</div>
-        <h1>Grok Register</h1>
-        <p>运行控制页采用左右布局，左侧只保留关键状态、总开关和常用设置，右侧显示实时控制台日志。</p>
-      </div>
-      <div class="topbar-meta">
-        <a class="nav-link{% if active_page == "controller" %} active{% endif %}" href="/">运行控制</a>
-        <a class="nav-link{% if active_page == "settings" %} active{% endif %}" href="/settings">系统配置 / 健康检查</a>
-        <div class="meta-card">
-          <div class="meta-label">Source</div>
-          <div class="meta-value">{{ source_project }}</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">并发上限</div>
-          <div class="meta-value">{{ max_concurrent_tasks }}</div>
-        </div>
+      <div class="topbar-inner">
+        <a class="brand brand-link" href="/">
+          <span class="brand-title">Auto Register</span>
+        </a>
+        <nav class="main-nav" aria-label="主导航">
+          <a class="nav-link{% if active_page == "controller" %} active{% endif %}" href="/">运行控制</a>
+          <a class="nav-link{% if active_page == "settings" %} active{% endif %}" href="/settings">系统配置</a>
+        </nav>
+        <div class="topbar-actions"></div>
       </div>
     </header>
 
     <main class="main">
       <section class="workspace workspace-controller">
         <section class="panel panel-controller-side">
-          <div class="panel-head">
+          <div class="panel-head panel-head-stack">
             <div>
               <div class="eyebrow">Controller</div>
-              <h2>单控制器</h2>
-              <p class="panel-desc">总开关开启后才会根据自动补号配置决定是否按阈值自动补号。</p>
+              <h2>自动补号</h2>
             </div>
-            <div class="button-row">
+            <div class="button-row controller-action-row">
               <button id="masterToggleBtn" class="button" type="button">开始</button>
-              <button id="manualCheckBtn" class="button button-secondary" type="button">立即检测一次</button>
+              <button id="manualCheckBtn" class="button button-secondary" type="button">检测</button>
               <button id="toggleControllerSettingsBtn" class="button button-secondary" type="button">设置</button>
             </div>
           </div>
@@ -48,58 +40,69 @@
           <div id="controllerSummary" class="summary-grid summary-grid-compact"></div>
         </section>
 
-        <div id="controllerSettingsModal" class="modal hidden" hidden>
-          <div id="controllerSettingsBackdrop" class="modal-backdrop"></div>
-          <div class="modal-dialog">
-            <div class="panel-head modal-head">
-              <div>
-                <div class="eyebrow">Controller Settings</div>
-                <h2>控制器设置</h2>
-                <p class="panel-desc">这里调整自动补号、并发数和阈值，不会影响系统默认配置页。</p>
-              </div>
-              <button id="closeControllerSettingsBtn" class="button button-secondary" type="button">关闭</button>
-            </div>
-            <form id="controllerSettingsForm" class="task-form controller-settings-form">
-              <label class="checkbox-row full">
-                <input name="auto_refill_enabled" type="checkbox">
-                <span>开启自动补号</span>
-              </label>
-              <label>
-                <span>并发数</span>
-                <small>内部同时运行多少个 worker。</small>
-                <input name="concurrency" type="number" min="1" max="32">
-              </label>
-              <label>
-                <span>启动阈值</span>
-                <small>远端账号数低于该值时自动开始补号。</small>
-                <input name="start_threshold" type="number" min="0">
-              </label>
-              <label>
-                <span>停止阈值</span>
-                <small>远端账号数达到该值时自动停止补号。</small>
-                <input name="stop_threshold" type="number" min="1">
-              </label>
-              <div class="form-actions full">
-                <button class="button" type="submit">保存控制设置</button>
-              </div>
-            </form>
-          </div>
-        </div>
-
-        <section class="panel panel-detail">
-          <div class="panel-head">
+        <section class="panel panel-detail panel-log-card">
+          <div class="panel-head panel-head-compact">
             <div>
               <div class="eyebrow">Live Console</div>
-              <h2>控制器日志</h2>
-              <p class="panel-desc">只显示启动、停止、成功、失败和推送等关键事件，远端账号数轮询不会再刷屏。</p>
+              <h2>控制台</h2>
             </div>
+            <button id="consoleLockBtn" class="button button-secondary button-sm" type="button">锁定</button>
           </div>
           <div class="console-wrap">
-            <div class="console-head">实时汇总日志</div>
             <pre id="consoleOutput" class="console-output">等待控制器输出</pre>
           </div>
         </section>
       </section>
+
+      <div id="controllerSettingsModal" class="modal hidden" hidden>
+        <div id="controllerSettingsBackdrop" class="modal-backdrop"></div>
+        <div class="modal-dialog modal-dialog-controller">
+          <button id="closeControllerSettingsBtn" class="modal-close" type="button" aria-label="关闭">&times;</button>
+          <div class="panel-head modal-head">
+            <div>
+              <div class="eyebrow">Controller Settings</div>
+              <h2>控制器设置</h2>
+              <p class="panel-desc">调整自动补号、并发数和启停阈值，这些配置会直接影响当前控制器策略。</p>
+            </div>
+          </div>
+          <form id="controllerSettingsForm" class="modal-form">
+            <label class="toggle-row">
+              <span class="toggle-label">开启自动补号</span>
+              <span class="toggle-wrap">
+                <input name="auto_refill_enabled" type="checkbox" class="toggle-input">
+                <span class="toggle-track"></span>
+              </span>
+            </label>
+            <div class="modal-fields">
+              <label class="modal-field">
+                <span>并发数</span>
+                <small>同时运行的 worker 数量</small>
+                <input name="concurrency" type="number" min="1" max="32">
+              </label>
+              <label class="modal-field">
+                <span>单次补号数</span>
+                <small>不开自动时每次补多少个</small>
+                <input name="single_batch_count" type="number" min="1">
+              </label>
+            </div>
+            <div class="modal-fields">
+              <label class="modal-field">
+                <span>启动阈值</span>
+                <small>低于此值自动开始补号</small>
+                <input name="start_threshold" type="number" min="0">
+              </label>
+              <label class="modal-field">
+                <span>停止阈值</span>
+                <small>达到此值自动停止补号</small>
+                <input name="stop_threshold" type="number" min="1">
+              </label>
+            </div>
+            <div class="modal-actions">
+              <button class="button" type="submit">保存控制设置</button>
+            </div>
+          </form>
+        </div>
+      </div>
     </main>
   </div>
 

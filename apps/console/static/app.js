@@ -1,6 +1,7 @@
 (function () {
   const state = {
     runtime: null,
+    consoleLocked: false,
   };
 
   const page = document.body.dataset.page || "controller";
@@ -19,6 +20,7 @@
   const controllerSettingsModalEl = document.getElementById("controllerSettingsModal");
   const controllerSettingsBackdropEl = document.getElementById("controllerSettingsBackdrop");
   const closeControllerSettingsBtnEl = document.getElementById("closeControllerSettingsBtn");
+  const consoleLockBtnEl = document.getElementById("consoleLockBtn");
 
   function escapeHtml(value) {
     if (value === null || value === undefined) {
@@ -30,8 +32,21 @@
       .replaceAll(">", "&gt;");
   }
 
+  const STATUS_LABELS = {
+    idle: "空闲",
+    manual_running: "运行中",
+    auto_idle: "待命",
+    auto_running: "运行中",
+    stopping: "停止中",
+    error: "异常",
+  };
+
   function statusClass(status) {
     return `status-pill status-${status || "unknown"}`;
+  }
+
+  function statusLabel(status) {
+    return STATUS_LABELS[status] || status || "未知";
   }
 
   function healthClass(ok) {
@@ -71,6 +86,7 @@
     const controller = controllerDefaults();
     controllerSettingsFormEl.elements.concurrency.value = controller.concurrency ?? 1;
     controllerSettingsFormEl.elements.auto_refill_enabled.checked = Boolean(controller.auto_refill_enabled);
+    controllerSettingsFormEl.elements.single_batch_count.value = controller.single_batch_count ?? 10;
     controllerSettingsFormEl.elements.start_threshold.value = controller.start_threshold ?? 20;
     controllerSettingsFormEl.elements.stop_threshold.value = controller.stop_threshold ?? 50;
   }
@@ -119,18 +135,19 @@
     state.runtime = runtime;
     const controller = controllerDefaults();
     const summaryRows = [
-      [["状态", `<span class="${statusClass(runtime.status)}">${escapeHtml(runtime.status)}</span>`]],
+      [["状态", (runtime.status === "auto_running" || runtime.status === "manual_running") ? `<span class="status-value-row"><span class="equalizer" aria-hidden="true"><span class="equalizer-bar"></span><span class="equalizer-bar"></span><span class="equalizer-bar"></span><span class="equalizer-bar"></span><span class="equalizer-bar"></span></span></span>` : `<span class="summary-inline-value ${statusClass(runtime.status)}">${escapeHtml(statusLabel(runtime.status))}</span>`, true]],
       [["远端账号数", runtime.remote_token_count], ["活跃 worker", runtime.current_running_workers]],
       [["累计成功", runtime.completed_count], ["累计失败", runtime.failed_count]],
-      [["是否自动补号", controller.auto_refill_enabled ? "开启" : "关闭"]],
+      [["单次补号数", controller.single_batch_count ?? 10], ["自动补号", controller.auto_refill_enabled ? "开启" : "关闭"]],
       [["启动阈值", controller.start_threshold ?? 20], ["停止阈值", controller.stop_threshold ?? 50]],
     ];
     controllerSummaryEl.innerHTML = summaryRows.map((row) => `
       <div class="summary-row summary-row-cols-${row.length}">
-        ${row.map(([label, value]) => `
-          <div class="summary-item">
-            <div class="meta-item-label">${escapeHtml(label)}</div>
-            <div class="meta-item-value">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</div>
+        ${row.map(([label, value, inline]) => `
+          <div class="summary-item${inline ? " summary-item-inline" : ""}">
+            ${inline
+              ? `<div class="summary-inline-row"><span class="meta-item-label summary-inline-label">${escapeHtml(label)}</span><span class="meta-item-value summary-inline-content">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</span></div>`
+              : `<div class="meta-item-label">${escapeHtml(label)}</div><div class="meta-item-value">${typeof value === "string" && value.includes("status-pill") ? value : escapeHtml(value)}</div>`}
           </div>
         `).join("")}
       </div>
@@ -178,7 +195,7 @@
   }
 
   async function refreshLogs() {
-    if (!consoleOutputEl) {
+    if (!consoleOutputEl || state.consoleLocked) {
       return;
     }
     const data = await fetchJson("/api/controller/logs?limit=400");
@@ -241,6 +258,7 @@
       const payload = {
         concurrency: Number(controllerSettingsFormEl.elements.concurrency.value),
         auto_refill_enabled: controllerSettingsFormEl.elements.auto_refill_enabled.checked,
+        single_batch_count: Number(controllerSettingsFormEl.elements.single_batch_count.value),
         start_threshold: Number(controllerSettingsFormEl.elements.start_threshold.value),
         stop_threshold: Number(controllerSettingsFormEl.elements.stop_threshold.value),
       };
@@ -307,6 +325,16 @@
 
   if (healthRefreshBtnEl) {
     healthRefreshBtnEl.addEventListener("click", refreshHealth);
+  }
+
+  if (consoleLockBtnEl) {
+    consoleLockBtnEl.addEventListener("click", () => {
+      state.consoleLocked = !state.consoleLocked;
+      consoleLockBtnEl.textContent = state.consoleLocked ? "解锁" : "锁定";
+      consoleLockBtnEl.className = state.consoleLocked
+        ? "button button-sm button-locked"
+        : "button button-secondary button-sm";
+    });
   }
 
   setSettingsDefaults();

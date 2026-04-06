@@ -111,6 +111,7 @@ def load_source_defaults() -> dict[str, Any]:
                 "controller": {
                     "concurrency": 1,
                     "auto_refill_enabled": False,
+                    "single_batch_count": 10,
                     "start_threshold": 20,
                     "stop_threshold": 50,
                     "push_batch_size": 10,
@@ -155,6 +156,7 @@ def load_source_defaults() -> dict[str, Any]:
     controller = dict(base.get("controller") or {})
     controller.setdefault("concurrency", 1)
     controller.setdefault("auto_refill_enabled", False)
+    controller.setdefault("single_batch_count", 10)
     controller.setdefault("start_threshold", 20)
     controller.setdefault("stop_threshold", 50)
     controller.setdefault("push_batch_size", 10)
@@ -282,12 +284,13 @@ class SystemSettings(BaseModel):
 class ControllerSettingsPayload(BaseModel):
     concurrency: int = Field(1, ge=1, le=32)
     auto_refill_enabled: bool = False
+    single_batch_count: int = Field(10, ge=1, le=100000)
     start_threshold: int = Field(20, ge=0, le=1000000)
     stop_threshold: int = Field(50, ge=1, le=1000000)
 
     @model_validator(mode="after")
     def validate_thresholds(self) -> "ControllerSettingsPayload":
-        if self.start_threshold >= self.stop_threshold:
+        if self.auto_refill_enabled and self.start_threshold >= self.stop_threshold:
             raise ValueError("启动阈值必须小于停止阈值")
         return self
 
@@ -577,6 +580,7 @@ class SingleControllerSupervisor:
 
     def request_stop(self, flush_pending: bool = True) -> None:
         with self._lock:
+            was_enabled = self._runtime.controller_enabled
             self._runtime.controller_enabled = False
             self._runtime.desired_running = False
             self._runtime.stop_requested = True
@@ -588,7 +592,8 @@ class SingleControllerSupervisor:
                 self._runtime.status = STATUS_IDLE
                 self._runtime.current_phase = "idle"
             self._runtime.last_stopped_at = now_iso()
-        self.append_log("[controller] 总开关已关闭")
+        if was_enabled:
+            self.append_log("[controller] 总开关已关闭")
         for slot, worker in list(self._workers.items()):
             try:
                 os.killpg(worker.process.pid, signal.SIGTERM)
@@ -721,13 +726,21 @@ class SingleControllerSupervisor:
                     self._runtime.current_phase = "idle"
                 return
             if not controller.get("auto_refill_enabled"):
-                self._runtime.desired_running = True
-                if self._workers or self._runtime.desired_running:
+                batch_limit = int(controller.get("single_batch_count", 10))
+                if self._runtime.completed_count >= batch_limit:
+                    self._runtime.desired_running = False
+                    if self._workers:
+                        self._runtime.status = STATUS_STOPPING
+                        self._runtime.current_phase = "stopping_workers"
+                    else:
+                        self._runtime.status = STATUS_IDLE
+                        self._runtime.current_phase = "idle"
+                        self._runtime.controller_enabled = False
+                        self.append_log(f"[controller] 单次补号完成 ({self._runtime.completed_count}/{batch_limit})")
+                else:
+                    self._runtime.desired_running = True
                     self._runtime.status = STATUS_MANUAL_RUNNING
                     self._runtime.current_phase = "manual_running"
-                else:
-                    self._runtime.status = STATUS_IDLE
-                    self._runtime.current_phase = "idle"
                 return
             if self._runtime.remote_token_count < int(controller.get("start_threshold", 20)):
                 self._runtime.desired_running = True
