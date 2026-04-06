@@ -184,13 +184,19 @@
     }
   }
 
+  function isModalOpen() {
+    return controllerSettingsModalEl && !controllerSettingsModalEl.classList.contains("hidden");
+  }
+
   async function refreshController() {
     if (!controllerSummaryEl) {
       return;
     }
     const data = await fetchJson("/api/controller");
     window.__DEFAULTS__ = data.defaults || window.__DEFAULTS__;
-    setControllerDefaults();
+    if (!isModalOpen()) {
+      setControllerDefaults();
+    }
     renderRuntime(data.runtime || null);
   }
 
