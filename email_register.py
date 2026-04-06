@@ -294,6 +294,18 @@ def fetch_email_detail(mail_token: str, msg_id: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def _list_message_text(msg: Dict[str, Any]) -> str:
+    """列表接口常带 subject / preview；不拉详情也可能含验证码（绕过详情 500 等故障）。"""
+    parts: List[str] = []
+    sub = msg.get("subject")
+    if sub:
+        parts.append(_stringify_mail_part(sub))
+    prev = msg.get("preview") or msg.get("snippet") or msg.get("textPreview")
+    if prev:
+        parts.append(_stringify_mail_part(prev))
+    return "\n".join(p for p in parts if p)
+
+
 def wait_for_verification_code(mail_token: str, timeout: int = 120) -> Optional[str]:
     """轮询临时邮箱，等待验证码邮件。"""
     start = time.time()
@@ -312,10 +324,16 @@ def wait_for_verification_code(mail_token: str, timeout: int = 120) -> Optional[
             msg_id = msg.get("id") or msg.get("messageId") or msg.get("uuid")
             if not msg_id or msg_id in seen_ids:
                 continue
-            seen_ids.add(msg_id)
+
+            list_text = _list_message_text(msg)
+            code = extract_verification_code(list_text)
+            if code:
+                print(f"[*] 从 {_provider_label()} 列表字段提取到验证码: {code}")
+                return code
 
             detail = fetch_email_detail(mail_token, str(msg_id))
             if not detail:
+                # 详情失败（如对方读后删信 500）时不要标记已处理，下次轮询可重试或改走列表
                 continue
 
             content = _extract_mail_content(detail)
@@ -323,6 +341,8 @@ def wait_for_verification_code(mail_token: str, timeout: int = 120) -> Optional[
             if code:
                 print(f"[*] 从 {_provider_label()} 提取到验证码: {code}")
                 return code
+            # 已拉到正文仍无验证码，当作非 OTP 邮件跳过
+            seen_ids.add(msg_id)
         time.sleep(3)
     return None
 
