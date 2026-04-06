@@ -9,7 +9,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "127.0.0.1:1080:1080"
+      - "1080:1080"
 
   console:
     build:
